@@ -38,6 +38,25 @@ const REQUESTS_PER_KB = 5;
 const TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
 const ACTIVE_UUID_CACHE_TTL = 60 * 1000; // 1 minute
 
+// --- Anti-DPI trio (fragment finalMask + unsafe fingerprint + cipherSuites) ---
+// Client-side only: shaped into the TLS/TCP handshake by Xray-lineage clients
+// (PattNG/v2rayNG/v2rayN). Parsed as fp / cs / fm query params; other clients
+// (Clash/sing-box/Hiddify) ignore cs+fm.
+const SG_CIPHER_SUITES = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256';
+const SG_FINAL_MASK = JSON.stringify({
+    tcp: [
+        { type: 'fragment', settings: { packets: 'tlshello', lengths: ['0', '104', '1'], delays: ['0'], maxSplit: '0' } },
+        { type: 'fragment', settings: { packets: '1-1', lengths: ['114', '1'], delays: ['1'], maxSplit: '11' } }
+    ]
+});
+const ANTI_DPI_PARAMS = `&fp=unsafe&cs=${encodeURIComponent(SG_CIPHER_SUITES)}&fm=${encodeURIComponent(SG_FINAL_MASK)}`;
+
+// IPv6 literals must be bracketed inside vless:// trojan:// URIs: vless://uuid@[2606:4700::]:443?...
+// Domains and IPv4 pass through unchanged.
+function sgLinkHost(h) {
+    return (typeof h === 'string' && h.includes(':')) ? `[${h}]` : h;
+}
+
 // ============================================
 // INITIALIZATION
 // ============================================
@@ -132,6 +151,8 @@ const USER_CACHE_TTL = 60 * 1000;
 let userStatusCache = null;   // Map: uuid -> { data: userRow, expires: ts }
 let userStatusCacheTime = 0;
 
+const userLookupInflight = new Map(); // uuid -> Promise: concurrent misses share ONE D1 read
+
 async function getCachedUser(env, uuid) {
     const now = Date.now();
     if (!userStatusCache || now - userStatusCacheTime > USER_CACHE_TTL) {
@@ -141,11 +162,19 @@ async function getCachedUser(env, uuid) {
     const hit = userStatusCache.get(uuid);
     if (hit && hit.expires > now) return hit.data;
     try {
-        const user = await env.DB.prepare(
-            'SELECT id, uuid, is_active, is_frozen, expires_at, max_bandwidth_bytes, max_bandwidth_mb, used_bandwidth_bytes, max_connections FROM users WHERE uuid = ?'
-        ).bind(uuid).first();
+        let p = userLookupInflight.get(uuid);
+        if (!p) {
+            p = (async () => await env.DB.prepare(
+                'SELECT id, uuid, is_active, is_frozen, expires_at, max_bandwidth_bytes, max_bandwidth_mb, used_bandwidth_bytes, max_connections FROM users WHERE uuid = ?'
+            ).bind(uuid).first())();
+            userLookupInflight.set(uuid, p);
+            p.then(() => userLookupInflight.delete(uuid), () => userLookupInflight.delete(uuid));
+        }
+        const user = await p;
         if (user) {
-            userStatusCache.set(uuid, { data: user, expires: now + USER_CACHE_TTL });
+            // clearUUIDCache()/invalidate may have nulled the map while we awaited.
+            if (!userStatusCache) { userStatusCache = new Map(); userStatusCacheTime = Date.now(); }
+            userStatusCache.set(uuid, { data: user, expires: Date.now() + USER_CACHE_TTL });
             return user;
         }
     } catch (e) {
@@ -195,228 +224,312 @@ function getSubnetGroup(ip) {
 	if (parts.length === 4) return parts.slice(0, 3).join('.') + '.0/24';
 	return ip;
 }
-// Per-isolate open-socket refcount per device (uuid + subnet). A device row is
-// only deleted when its LAST socket closes — otherwise one closing tab knocks
-// a device with several open sockets off the panel and the counter.
-const deviceSocketCounts = new Map(); // key: uuid + '\n' + subnet -> { n, ts }
-// Seen-device keys for cheap "is this a new device?" checks (avoids a users-table
-// UPDATE on every socket open — only genuinely new devices bump the counter).
-const deviceRowSeen = new Map(); // key: numericUserId + ':' + subnet -> timestamp ms
-function deviceSocketOpened(uuid, subnet) {
-	const key = uuid + '\n' + subnet;
-	const rec = deviceSocketCounts.get(key);
-	if (rec) { rec.n += 1; rec.ts = Date.now(); }
-	else deviceSocketCounts.set(key, { n: 1, ts: Date.now() });
-	if (deviceSocketCounts.size > 20000) {
-		const now = Date.now();
-		for (const [k, v] of deviceSocketCounts) {
-			if (now - v.ts > 30 * 60 * 1000) deviceSocketCounts.delete(k);
-		}
-	}
+// ============================================
+// DEVICE REGISTRY + ADMISSION  (max_connections enforcement)
+// ============================================
+// A "device" is one (user, subnet) pair — IPv4 /24, IPv6 /64. max_connections limits
+// DISTINCT LIVE DEVICES, never raw sockets (a browser opens dozens per page).
+//
+//  1. Every isolate keeps a small registry  uuid -> subnet -> { n, seen, claimed, ... }
+//     (n = open sockets). Known devices are admitted from memory: ZERO D1 operations.
+//  2. A device this isolate has not claimed for DEVICE_CLAIM_TTL is claimed in D1 with
+//     ONE atomic conditional upsert (claimDeviceRow). D1 serialises writes, so two
+//     isolates racing for the last slot can never both win. The same statement doubles
+//     as the row's liveness heartbeat.
+//  3. A rejected device is negative-cached for DEVICE_DENY_MS: a blocked client that
+//     hammers reconnects costs zero D1 operations.
+//  4. Heartbeats only refresh subnets this isolate has REAL traffic on, so a dead
+//     device is never kept alive by another device's activity (ghost devices).
+//  5. No per-socket and no per-close D1 writes; the row simply ages out of the window.
+//  6. If D1 is unavailable the limit is still enforced locally (per isolate) instead
+//     of failing completely open.
+const DEVICE_LIVE_MS = 10 * 60 * 1000;   // the 10-minute window every live-device query uses
+const DEVICE_CLAIM_TTL = 5 * 60 * 1000;  // per isolate: touch a device's D1 row at most this often
+const DEVICE_GRACE_MS = 4 * 60 * 1000;   // socket-less transports (XHTTP/gRPC) count as live this long after traffic
+const DEVICE_DENY_MS = 15 * 1000;        // negative-cache lifetime for a rejected device
+const DEVICE_ADMIT_WINDOW_MIN = 7;       // a slot is held by rows fresher than this (< 10-min display window)
+const liveDevices = new Map();           // uuid -> Map(subnet -> { n, seen, claimed, deniedUntil, uid, ip, proto, beating })
+const claimInflight = new Map();         // uuid\nsubnet -> Promise (a burst of sockets shares one claim)
+
+function deviceMap(uuid) {
+    let m = liveDevices.get(uuid);
+    if (!m) {
+        if (liveDevices.size > 5000) {
+            for (const [k, v] of liveDevices) { if (v.size === 0) liveDevices.delete(k); }
+        }
+        m = new Map();
+        liveDevices.set(uuid, m);
+    }
+    return m;
+}
+function deviceEntry(uuid, subnet, uid) {
+    const m = deviceMap(uuid);
+    let d = m.get(subnet);
+    if (!d) {
+        d = { n: 0, seen: 0, claimed: 0, deniedUntil: 0, uid: uid || 0, ip: 'unknown', proto: 'vless', beating: false };
+        m.set(subnet, d);
+    }
+    if (uid) d.uid = uid;
+    return d;
+}
+function pruneDevices(map, now) {
+    // Drop devices with no open socket, idle past the live window and not under a deny timer.
+    for (const [sub, d] of map) {
+        if (d.n <= 0 && now - d.seen > DEVICE_LIVE_MS && !(d.deniedUntil > now)) map.delete(sub);
+    }
+}
+function deviceSocketOpened(uuid, subnet, uid) {
+    const d = deviceEntry(uuid, subnet, uid);
+    d.n += 1;
+    d.seen = Date.now();
 }
 function deviceSocketClosed(uuid, subnet) {
-	// Returns true when the last known socket for this device closed.
-	const key = uuid + '\n' + subnet;
-	const rec = deviceSocketCounts.get(key);
-	if (!rec) return true;
-	rec.n -= 1;
-	if (rec.n <= 0) { deviceSocketCounts.delete(key); return true; }
-	return false;
+    // Returns true when the last known socket of this device closed.
+    const m = liveDevices.get(uuid);
+    const d = m && m.get(subnet);
+    if (!d) return true;
+    d.n = Math.max(0, d.n - 1);
+    d.seen = Date.now();
+    return d.n === 0;
+}
+function liveSubnetsFor(uuid, now) {
+    const out = [];
+    const m = liveDevices.get(uuid);
+    if (!m) return out;
+    for (const [sub, d] of m) {
+        if (d.n > 0 || now - d.seen < DEVICE_GRACE_MS) { out.push(sub); if (out.length >= 32) break; }
+    }
+    return out;
+}
+function localOtherLiveCount(map, subnet, now) {
+    let c = 0;
+    for (const [sub, d] of map) {
+        if (sub !== subnet && (d.n > 0 || now - d.seen < DEVICE_LIVE_MS)) c++;
+    }
+    return c;
+}
+
+// Atomic claim: grants the slot (true) or reports the limit reached (false). Throws on D1 failure.
+// Granted when ANY of: the user is unlimited; this device already holds a live row (so a
+// device is never kicked because the admin lowered the limit); or fewer than max OTHER
+// devices are live. One statement = one atomic decision, and it refreshes the row too.
+async function claimDeviceRow(env, user, subnet, ip, proto) {
+    const max = Number(user.max_connections) > 0 ? Number(user.max_connections) : 0;
+    const key = user.id + ':' + subnet;
+    const res = await env.DB.prepare(
+        `INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol, connected_at, last_activity)
+         SELECT ?, ?, ?, ?, ?, datetime('now'), datetime('now')
+         WHERE ? <= 0
+            OR EXISTS (SELECT 1 FROM active_connections WHERE connection_id = ? AND last_activity >= datetime('now', '-10 minutes'))
+            OR (SELECT COUNT(DISTINCT subnet) FROM active_connections
+                WHERE user_id = ? AND subnet != ? AND last_activity >= datetime('now', '-${DEVICE_ADMIT_WINDOW_MIN} minutes')) < ?
+         ON CONFLICT(connection_id) DO UPDATE SET
+            connected_at = CASE WHEN last_activity < datetime('now', '-10 minutes') THEN datetime('now') ELSE connected_at END,
+            last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
+    ).bind(user.id, key, ip, subnet, proto, max, key, user.id, subnet, max).run();
+    return ((res.meta && res.meta.changes) || res.changes || 0) > 0;
 }
 
 async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
-	try {
-		if (!env.DB) return false;
-		// Cached user row (60s TTL): this runs on EVERY proxied connection open and
-		// previously did a full SELECT * per call — thousands of redundant D1 reads/day.
-		const user = await getCachedUser(env, uuid);
-		if (!user || user.is_active !== 1) return false;
+    try {
+        if (!env.DB) return false;
+        // Cached user row (60s TTL, shared in-flight lookups): zero D1 reads on the hot path.
+        const user = await getCachedUser(env, uuid);
+        if (!user || user.is_active !== 1) return false;
+        if (user.is_frozen) return false;
+        if (user.expires_at && user.expires_at <= currentTimestamp()) return false;
 
-		// Check if frozen
-		if (user.is_frozen) return false;
+        // used_bandwidth_bytes advances in 100MB/5min flushes; the hard cutoff happens at
+        // flush time (checkBandwidthAlerts auto-disable) — accept the small overshoot window.
+        const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
+        if (maxBW > 0 && user.used_bandwidth_bytes >= maxBW) return false;
 
-		// Check expiration
-		if (user.expires_at && user.expires_at <= currentTimestamp()) {
-			return false;
-		}
+        const now = Date.now();
+        const ip = clientIP || 'unknown';
+        const proto = protocol || 'vless';
+        const subnet = getSubnetGroup(ip);
+        const map = deviceMap(uuid);
+        pruneDevices(map, now);
 
-		// Check bandwidth limit (v2: use max_bandwidth_bytes).
-		// NOTE: used_bandwidth_bytes now advances in 100MB/5min flushes, so a user may
-		// overshoot by up to one buffer between writes; hard cutoff happens at flush
-		// time (checkBandwidthAlerts auto-disable) — accept the small window.
-		const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
-		if (maxBW > 0) {
-			if (user.used_bandwidth_bytes >= maxBW) {
-				return false;
-			}
-		}
+        const known = map.get(subnet);
+        if (known) {
+            if (now - known.claimed < DEVICE_CLAIM_TTL) { known.seen = now; return true; } // known device: no D1
+            if (known.deniedUntil > now) return false;                                      // recently rejected: no D1
+        }
 
-		// Check connection limit — count distinct subnet groups as devices.
-		// In-isolate device set first (fresh, zero D1 cost), then the D1 device rows
-		// (shared across isolates) as fallback.
-		if (user.max_connections > 0) {
-			const subnet = getSubnetGroup(clientIP);
-			const buffer = bwBuffer.get(uuid);
-			const localDevices = buffer ? [...buffer.devices] : [];
-			if (localDevices.length >= user.max_connections && !localDevices.includes(subnet)) {
-				return false;
-			}
-			const deviceRows = await env.DB.prepare(
-				'SELECT DISTINCT subnet FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes") LIMIT ?'
-			).bind(user.id, (user.max_connections || 1) + 1).all();
-			const dbDevices = (deviceRows.results || []).map(r => r.subnet).filter(s => s);
-			const allDevices = new Set([...localDevices, ...dbDevices]);
-			if (allDevices.size >= user.max_connections && !allDevices.has(subnet)) {
-				return false;
-			}
-		}
+        const maxDevices = Number(user.max_connections) > 0 ? Number(user.max_connections) : 0;
+        const ck = uuid + '\n' + subnet;
+        let claim = claimInflight.get(ck);
+        if (!claim) {
+            claim = claimDeviceRow(env, user, subnet, ip, proto);
+            claimInflight.set(ck, claim);
+            claim.then(() => claimInflight.delete(ck), () => claimInflight.delete(ck));
+        }
+        let granted, degraded = false;
+        try {
+            granted = await claim;
+        } catch (e) {
+            // D1 unavailable (e.g. daily write limit exhausted): keep the tunnel up but still
+            // enforce the limit with what this isolate knows, instead of failing fully open.
+            console.error('[Devices] claim failed, enforcing locally:', e && e.message ? e.message : e);
+            degraded = true;
+            granted = maxDevices === 0 || localOtherLiveCount(map, subnet, now) < maxDevices;
+        }
+        const dev = deviceEntry(uuid, subnet, user.id);
+        dev.ip = ip; dev.proto = proto;
+        if (!granted) { dev.deniedUntil = now + DEVICE_DENY_MS; return false; }
+        dev.seen = now; dev.deniedUntil = 0;
+        dev.claimed = degraded ? now - DEVICE_CLAIM_TTL + 30 * 1000 : now; // degraded: retry D1 in 30s
+        if (!degraded) mgmtMaybeCleanupStaleConnections(env).catch(() => {}); // throttled, detached
+        return true;
+    } catch (e) {
+        // Unexpected failure → fail OPEN so the tunnel keeps working.
+        console.error('UUID validation error (fail-open):', e);
+        return true;
+    }
+}
 
-		return true;
-	} catch (e) {
-		// D1 unavailable (e.g. daily write limit exhausted) → fail OPEN so the tunnel
-		// keeps working without quota enforcement instead of dying with the database.
-		console.error('UUID validation error (fail-open):', e);
-		return true;
-	}
+// Validation for transports without a per-socket hook (XHTTP / gRPC). Non-managed UUIDs
+// (not a subscription user) pass untouched. Returns { ok, subnet }.
+async function mgmtAdmitStateless(env, uuid, request, proto) {
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    try {
+        const user = await getCachedUser(env, uuid);
+        if (!user) return { ok: true, subnet: null };
+    } catch (e) { return { ok: true, subnet: null }; }
+    const ok = await mgmtValidateUUID(env, uuid, ip, proto || 'vless');
+    return { ok, subnet: getSubnetGroup(ip) };
+}
+
+// Traffic heartbeat: call on inbound data. Keeps a device "seen" in memory (free) and, at
+// most once per DEVICE_CLAIM_TTL, refreshes its D1 row in the background — so liveness
+// does not depend on a byte threshold being reached. Never blocks or throws.
+function mgmtDeviceBeat(env, uuid, subnet) {
+    try {
+        const m = liveDevices.get(uuid);
+        const d = m && m.get(subnet);
+        if (!d) return;
+        const now = Date.now();
+        d.seen = now;
+        if (d.beating || now - d.claimed < DEVICE_CLAIM_TTL || !env || !env.DB) return;
+        d.beating = true;
+        (async () => {
+            try {
+                const user = await getCachedUser(env, uuid);
+                if (user) await claimDeviceRow(env, user, subnet, d.ip, d.proto);
+                d.claimed = Date.now();
+            } catch (e) {
+                d.claimed = Date.now() - DEVICE_CLAIM_TTL + 30 * 1000;
+            } finally {
+                d.beating = false;
+            }
+        })();
+    } catch (e) { /* tracking must never break the tunnel */ }
 }
 
 // ============================================
 // DEVICE-GRAINED CONNECTION TRACKING
 // ============================================
-// Previously: one row PER WebSocket (browsers open dozens per page — thousands of
-// rows/day), each INSERT/DELETE paired with its own UPDATE of users.current_connections.
-// Now: one row per (user, subnet) DEVICE, kept fresh by the periodic flush.
-// Row key is `user_id:subnet` in connection_id. The users.current_connections /
-// is_online refresh rides along with the bandwidth flush batch (see flushBandwidth)
-// and the stale cleanup, so no separate per-connection UPDATEs at all.
+// One D1 row per (user, subnet) device, key `user_id:subnet` in connection_id. The
+// authoritative claim happens in mgmtValidateUUID; here sockets only move the in-isolate
+// refcount. Nothing in this section writes to D1 per socket.
 
 async function mgmtAddActiveConnection(env, uuid, connectionId, ipAddress, protocol) {
-	try {
-		if (!env.DB) return true;
-		const user = await getCachedUser(env, uuid);
-		if (!user) return false;
-		const ip = ipAddress || 'unknown';
-		const proto = protocol || 'vless';
-		const subnet = getSubnetGroup(ip);
-		// Register the device in the bandwidth buffer too, so the flush's
-		// users.is_online / current_connections update covers this connect
-		// without a dedicated write.
-		const e = bufferEntry(uuid);
-		e.devices.add(subnet);
-		if (!e.firstTs) e.firstTs = Date.now();
-		// D1 write diet: sockets do NOT write to D1 individually anymore. The
-		// socket is registered in-isolate (refcount + pending set); the device row
-		// upsert rides the periodic bandwidth flush batch (flushBandwidth), and
-		// only fires when this isolate actually knows a row write is needed:
-		// the device is NEW here (not seen in the last 90s). Repeat connects from
-		// a known device = zero D1 writes. fail-open: tracking never breaks the tunnel.
-		const seenDevKey = user.id + ':' + subnet;
-		const nowMs = Date.now();
-		const isFirstSeen = nowMs - (deviceRowSeen.get(seenDevKey) || 0) > 90 * 1000;
-		deviceSocketOpened(uuid, subnet);
-		if (isFirstSeen) {
-			deviceRowSeen.set(seenDevKey, nowMs);
-			const entry = bufferEntry(uuid);
-			entry.pendingDevices.add(subnet);
-			entry.pendingIps.set(subnet, ip);
-			entry.pendingProtos.set(subnet, proto);
-			if (!entry.firstTs) entry.firstTs = Date.now();
-			// Kick a flush soon so brand-new devices appear quickly (bounded: the
-			// flush itself still batches everything into ONE round-trip).
-			bwScheduleFlush(env, uuid).catch(() => {});
-		}
-		// Passive stale-row purge is NOT triggered per-connect anymore (option 3):
-		// it runs on admin-panel views, a 5-min timer, and the nightly cron.
-		return true;
-	} catch (e) {
-		// D1 write failed (quota exhausted, transient error) → fail OPEN: allow the
-		// connection untracked rather than killing the tunnel with the database.
-		console.error('Add active connection error (fail-open):', e);
-		return true;
-	}
+    try {
+        if (!env.DB) return true;
+        const user = await getCachedUser(env, uuid);
+        if (!user) return false;
+        deviceSocketOpened(uuid, getSubnetGroup(ipAddress || 'unknown'), user.id);
+        const e = bufferEntry(uuid);
+        if (!e.firstTs) e.firstTs = Date.now();
+        return true;
+    } catch (e) {
+        console.error('Add active connection error (fail-open):', e);
+        return true;
+    }
 }
 
-// Remove a device row — only when its connection closes AND no other socket from
-// the same device is still open (the 10s grace on last_activity decides: a fresh
-// row means another socket from that device is probably still active).
+// Socket closed. Only when the LAST socket of the device in this isolate closed do we
+// consider refreshing users.is_online (throttled). No DELETE: the row ages out of the window.
 async function mgmtRemoveActiveConnection(env, uuid, connectionId, protocol) {
-	try {
-		if (!env.DB) return;
-		const user = await getCachedUser(env, uuid);
-		if (!user) return;
-		// Callers pass the RAW subnet (older device keys were `<userId>:<subnet>`).
-		// A raw IPv6 subnet also contains colons, so only strip an exact
-		// "<this user's numeric id>:" prefix — never split inside the subnet.
-		const rawKey = String(connectionId || '');
-		const idPrefix = user.id + ':';
-		const subnet = rawKey.startsWith(idPrefix) ? rawKey.slice(idPrefix.length) : rawKey;
-		// Only proceed when the LAST socket from this device closed (per-isolate
-		// refcount) — one closing tab must not drop a device with other open
-		// sockets. D1 write diet: NO per-close DELETE anymore. The device row
-		// simply ages out of the 10-min live window (panel + counters read only
-		// fresh rows), so the cleanup purge removes it later — one write instead
-		// of tens of thousands of per-socket DELETEs per day.
-		if (!deviceSocketClosed(uuid, subnet)) return;
-		await refreshUserLiveState(env, user.id).catch(() => {});
-	} catch (e) {
-		console.error('Remove active connection error:', e);
-	}
+    try {
+        if (!env.DB) return;
+        const user = await getCachedUser(env, uuid);
+        if (!user) return;
+        // Callers pass the RAW subnet (older keys were `<userId>:<subnet>`); a raw IPv6 subnet
+        // also contains colons, so only strip an exact "<this user's id>:" prefix.
+        const rawKey = String(connectionId || '');
+        const idPrefix = user.id + ':';
+        const subnet = rawKey.startsWith(idPrefix) ? rawKey.slice(idPrefix.length) : rawKey;
+        if (!deviceSocketClosed(uuid, subnet)) return;
+        await refreshUserLiveState(env, user.id).catch(() => {});
+    } catch (e) {
+        console.error('Remove active connection error:', e);
+    }
 }
 
-// (device-row heartbeat rides in flushBandwidth's batch — per-connection heartbeat removed)
+// Recompute users.current_connections / is_online / last_online_at. Only rows that are
+// flagged online (or still counting devices) are touched, so the write cost is bounded by
+// the number of online users — never the whole users table.
+const LIVE_STATE_SYNC_SQL = `UPDATE users SET
+    current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime('now', '-10 minutes')),
+    is_online = CASE WHEN EXISTS (SELECT 1 FROM active_connections WHERE user_id = users.id AND last_activity >= datetime('now', '-10 minutes')) THEN 1 ELSE 0 END,
+    last_online_at = CASE WHEN is_online = 1 AND NOT EXISTS (SELECT 1 FROM active_connections WHERE user_id = users.id AND last_activity >= datetime('now', '-10 minutes')) THEN datetime('now') ELSE last_online_at END
+    WHERE is_online = 1 OR current_connections > 0`;
 
 async function mgmtCleanupStaleConnections(env) {
-	try {
-		if (!env.DB) return;
-		// Delete DEVICE rows not refreshed for 10 minutes (device rows are now
-		// heartbeated by the 5-min bandwidth flush instead of per-5MB chunks, so the
-		// purge window grew with it; 10 min tolerates an idle-but-open device).
-		// Rows freshened by a newer isolate still survive — last_activity is shared via D1.
-		const result = await env.DB.prepare(
-			"DELETE FROM active_connections WHERE last_activity < datetime('now', '-10 minutes')"
-		).run();
-		if (result.changes > 0) {
-			// Update current_connections = distinct subnets for all users; users whose
-			// last live connection expired drop the online flag here too.
-			await env.DB.prepare(
-				'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")) = 0 THEN 0 ELSE is_online END, last_online_at = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")) = 0 THEN datetime("now") ELSE last_online_at END'
-			).run();
-			console.log(`[CLEANUP] Removed ${result.changes} stale device rows`);
-		}
-	} catch (e) {
-		console.error('Cleanup stale connections error:', e);
-	}
+    try {
+        if (!env.DB) return;
+        // Delete DEVICE rows not refreshed for 10 minutes. Rows freshened by another isolate
+        // survive — last_activity is shared through D1.
+        const result = await env.DB.prepare(
+            "DELETE FROM active_connections WHERE last_activity < datetime('now', '-10 minutes')"
+        ).run();
+        const removed = (result.meta && result.meta.changes) || result.changes || 0;
+        if (removed > 0) {
+            await env.DB.prepare(LIVE_STATE_SYNC_SQL).run();
+            console.log(`[CLEANUP] Removed ${removed} stale device rows`);
+        }
+    } catch (e) {
+        console.error('Cleanup stale connections error:', e);
+    }
 }
 
-// Throttled wrapper: the passive stale-row purge runs at most once per minute
-// per isolate no matter how many sockets open. (This wrapper was missing for a
-// while, so the passive purge on connect silently never ran and zombie device
-// rows accumulated for hours — the panel then showed long-dead "connections".)
+// Throttled passive purge (once per 30 min per isolate), triggered by new-device claims.
 const mgmtCleanupThrottle = { last: 0 };
 async function mgmtMaybeCleanupStaleConnections(env) {
-	try {
-		const now = Date.now();
-		if (now - mgmtCleanupThrottle.last < 5 * 60 * 1000) return;
-		mgmtCleanupThrottle.last = now;
-		await mgmtCleanupStaleConnections(env);
-	} catch (e) {
-		console.error('Cleanup throttle error:', e);
-	}
+    try {
+        const now = Date.now();
+        if (now - mgmtCleanupThrottle.last < 30 * 60 * 1000) return;
+        mgmtCleanupThrottle.last = now;
+        await mgmtCleanupStaleConnections(env);
+    } catch (e) {
+        console.error('Cleanup throttle error:', e);
+    }
 }
 
-// Recompute one user's live connection state from FRESH device rows only.
-// current_connections = distinct live subnets; is_online = 1 iff any live row.
-// Single UPDATE (1 write) — called on new-device connects, last-socket closes
-// and manual disconnects so the panel is exact between bandwidth flushes.
+// One user's live state after their last socket closed / a manual disconnect. Throttled to
+// one write per user per 3 minutes per isolate: admin and panel views compute live state
+// from the device rows directly, so these stored columns are only a fallback.
+const liveStateThrottle = new Map();
 async function refreshUserLiveState(env, userId) {
-	try {
-		if (!env.DB || userId == null) return;
-		await env.DB.prepare(
-			'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) > 0 THEN 1 ELSE 0 END WHERE id = ?'
-		).bind(userId, userId, userId).run();
-	} catch (e) {
-		console.error('Refresh live state error:', e);
-	}
+    try {
+        if (!env.DB || userId == null) return;
+        const now = Date.now();
+        if (now - (liveStateThrottle.get(userId) || 0) < 3 * 60 * 1000) return;
+        liveStateThrottle.set(userId, now);
+        if (liveStateThrottle.size > 5000) {
+            for (const [k, t] of liveStateThrottle) { if (now - t > 3 * 60 * 1000) liveStateThrottle.delete(k); }
+        }
+        await env.DB.prepare(
+            `UPDATE users SET
+                current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-10 minutes')),
+                is_online = CASE WHEN EXISTS (SELECT 1 FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-10 minutes')) THEN 1 ELSE 0 END
+             WHERE id = ?`
+        ).bind(userId, userId, userId).run();
+    } catch (e) {
+        console.error('Refresh live state error:', e);
+    }
 }
 
 // ============================================
@@ -437,28 +550,15 @@ const BW_BUFFER_THRESHOLD = 100 * 1024 * 1024; // flush every 100MB
 const BW_BUFFER_MAX_AGE = 5 * 60 * 1000;       // ...or every 5 min while active
 const BW_BUFFER_CLOSE_MIN = 5 * 1024 * 1024;   // at connection close: flush if >=5MB buffered
 const BW_BUFFER_CLOSE_AGE = 3 * 60 * 1000;     // ...or buffer older than 3 min
-const bwBuffer = new Map(); // uuid -> { up, down, connects, devices, firstTs, lastTs, flushing }
+const bwBuffer = new Map(); // uuid -> { up, down, connects, firstTs, lastTs, flushing }
 
 function bufferEntry(uuid) {
     let e = bwBuffer.get(uuid);
     if (!e) {
-        e = { up: 0, down: 0, connects: 0, devices: new Set(), firstTs: 0, lastTs: 0, flushing: false,
-              pendingDevices: new Set(), pendingIps: new Map(), pendingProtos: new Map() };
+        e = { up: 0, down: 0, connects: 0, firstTs: 0, lastTs: 0, flushing: false };
         bwBuffer.set(uuid, e);
     }
-    if (!e.pendingDevices) { e.pendingDevices = new Set(); e.pendingIps = new Map(); e.pendingProtos = new Map(); }
     return e;
-}
-
-// Kick a flush within ~2s without stacking timers: one per uuid max.
-const bwFlushTimers = new Map();
-function bwScheduleFlush(env, uuid) {
-    if (bwFlushTimers.has(uuid)) return;
-    const t = setTimeout(() => {
-        bwFlushTimers.delete(uuid);
-        flushBandwidth(env, uuid, false).catch(() => {});
-    }, 2000);
-    bwFlushTimers.set(uuid, t);
 }
 
 async function flushBandwidth(env, uuid, closing) {
@@ -497,31 +597,13 @@ async function flushBandwidth(env, uuid, closing) {
         const compensatedUp = Math.ceil(up * 1.05);
         const compensatedDown = Math.ceil(down * 1.05);
         const compensatedTotal = compensatedUp + compensatedDown;
-        const connDelta = connects;
+        const connDelta = Math.max(connects, 0);
 
-        // Pending device-row upserts (from new-device connects) ride the same
-        // batch — each pending device is ONE statement, batched with everything
-        // else, so N new devices still cost ONE round-trip.
-        const pendingUpserts = [];
-        const pendingUpsertsFailed = [];
-        if (e.pendingDevices && e.pendingDevices.size) {
-            for (const sub of e.pendingDevices) {
-                const pip = e.pendingIps.get(sub) || 'unknown';
-                const pproto = e.pendingProtos.get(sub) || 'vless';
-                pendingUpsertsFailed.push({ sub, ip: pip, proto: pproto });
-                // user.id is numeric; re-fetch is avoided because the SELECT above
-                // already returned it.
-                pendingUpserts.push(env.DB.prepare(
-                    `INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol, connected_at, last_activity)
-                     VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-                     ON CONFLICT(connection_id) DO UPDATE SET last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
-                ).bind(user.id, user.id + ':' + sub, pip, sub, pproto));
-            }
-            e.pendingDevices.clear(); e.pendingIps.clear(); e.pendingProtos.clear();
-        }
-
-        // ONE round-trip for: daily rollup + user total + connect counter + online/device state
-        await env.DB.batch([
+        // Device heartbeat: refresh ONLY the subnets this isolate really has live traffic on.
+        // (A blanket "WHERE user_id = ?" kept every stale device alive as long as any other
+        // device of the same user was active, so the device limit filled with ghosts.)
+        const beat = liveSubnetsFor(uuid, Date.now());
+        const stmts = [
             env.DB.prepare(`
                 INSERT INTO bandwidth_usage (user_id, date, bytes_up, bytes_down, total_bytes, request_count)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -531,19 +613,23 @@ async function flushBandwidth(env, uuid, closing) {
                     bytes_down = bytes_down + ?,
                     total_bytes = total_bytes + ?,
                     request_count = request_count + ?
-            `).bind(user.id, today, compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0),
-                compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0)),
-            env.DB.prepare(
-                'UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, total_requests = total_requests + ?, is_online = 1, last_online_at = datetime("now"), last_used_at = datetime("now"), current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) WHERE id = ?'
-            ).bind(compensatedTotal, Math.max(connDelta, 0), user.id, user.id),
-            // Device-row heartbeat: flushes fire every 100MB/5min while traffic flows,
-            // so this keeps idle-but-open devices from being purged by the 10-min
-            // cleanup. Replaces the old per-5MB mgmtHeartbeatConnection writes.
-            env.DB.prepare(
-                "UPDATE active_connections SET last_activity = datetime('now') WHERE user_id = ?"
-            ).bind(user.id),
-            ...pendingUpserts,
-        ]);
+            `).bind(user.id, today, compensatedUp, compensatedDown, compensatedTotal, connDelta,
+                compensatedUp, compensatedDown, compensatedTotal, connDelta)
+        ];
+        if (beat.length) {
+            stmts.push(env.DB.prepare(
+                `UPDATE active_connections SET last_activity = datetime('now') WHERE user_id = ? AND subnet IN (${beat.map(() => '?').join(',')})`
+            ).bind(user.id, ...beat));
+        }
+        stmts.push(env.DB.prepare(
+            `UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, total_requests = total_requests + ?, is_online = 1, last_online_at = datetime('now'), last_used_at = datetime('now'),
+                current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-10 minutes')) WHERE id = ?`
+        ).bind(compensatedTotal, connDelta, user.id, user.id));
+
+        // ONE round-trip for: daily rollup + device heartbeat + user total + online/device state
+        await env.DB.batch(stmts);
+        const dm = liveDevices.get(uuid);
+        if (dm) { const t = Date.now(); for (const s of beat) { const d = dm.get(s); if (d) d.claimed = t; } }
         invalidateUserCache(uuid);
         await checkBandwidthAlerts(env, user.id, uuid, (user.used_bandwidth_bytes || 0) + compensatedTotal);
     } catch (err) {
@@ -553,14 +639,6 @@ async function flushBandwidth(env, uuid, closing) {
         if (cur) {
             cur.up += up; cur.down += down; cur.connects += connects;
             if (!cur.firstTs) cur.firstTs = Date.now() - BW_BUFFER_MAX_AGE + 30 * 1000;
-            // Pending device upserts that failed with the batch go back in the
-            // pending set so the next flush retries them (fail-open for tracking).
-            if (!cur.pendingDevices) { cur.pendingDevices = new Set(); cur.pendingIps = new Map(); cur.pendingProtos = new Map(); }
-            for (const pu of pendingUpsertsFailed) {
-                cur.pendingDevices.add(pu.sub);
-                cur.pendingIps.set(pu.sub, pu.ip);
-                cur.pendingProtos.set(pu.sub, pu.proto);
-            }
         }
     } finally {
         const cur = bwBuffer.get(uuid);
@@ -588,6 +666,7 @@ async function mgmtTrackBandwidth(env, uuid, bytesUp, bytesDown, opts = {}) {
         const up = bytesUp || 0;
         const down = bytesDown || 0;
         if (up <= 0 && down <= 0) return;
+        if (opts.subnet) mgmtDeviceBeat(env, uuid, opts.subnet); // XHTTP/gRPC liveness
         const e = bufferEntry(uuid);
         e.up += up;
         e.down += down;
@@ -599,18 +678,18 @@ async function mgmtTrackBandwidth(env, uuid, bytesUp, bytesDown, opts = {}) {
     }
 }
 
-// Log a connection event — deduplicated in-memory: a browser opens dozens of
-// WebSockets per minute (one per proxied TCP connection), and logging each one
-// was the single biggest contributor to D1's daily row-write limit burning out.
-// Keep one log entry per (uuid, IP, host) per 15 minutes; the rest are skipped.
+// Log a connection event — deduplicated in memory: a browser opens dozens of WebSockets
+// per minute, and logging each one was the biggest contributor to D1's daily row-write
+// limit. One entry per (uuid, device subnet) per 30 minutes per isolate. The user id comes
+// from the cached user row, so a logged connect costs ONE write and no read.
 const mgmtLogDedupe = new Map();
-const MGMT_LOG_DEDUPE_MS = 15 * 60 * 1000;
-const MGMT_LOG_DEDUPE_MAX = 500;
+const MGMT_LOG_DEDUPE_MS = 30 * 60 * 1000;
+const MGMT_LOG_DEDUPE_MAX = 2000;
 async function mgmtLogConnection(env, uuid, eventType, protocol, ipAddress, details) {
     try {
-        if (!env.DB || eventType !== 'connect') { /* non-connect events always log */ }
-        else {
-            const key = uuid + '|' + (ipAddress || '') + '|' + (details || '');
+        if (!env.DB) return;
+        if (eventType === 'connect') {
+            const key = uuid + '|' + getSubnetGroup(ipAddress || 'unknown');
             const now = Date.now();
             const last = mgmtLogDedupe.get(key);
             if (last && now - last < MGMT_LOG_DEDUPE_MS) return;
@@ -625,7 +704,7 @@ async function mgmtLogConnection(env, uuid, eventType, protocol, ipAddress, deta
                 }
             }
         }
-        const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
+        const user = await getCachedUser(env, uuid);
         if (!user) return;
         await env.DB.prepare(
             'INSERT INTO connection_logs (user_id, uuid, event_type, protocol, ip_address, details) VALUES (?, ?, ?, ?, ?, ?)'
@@ -1251,12 +1330,15 @@ async function mgmtGetUserConfigs(uuid, env, request) {
             allIPs.push({ name: c.name, ip: c.ip || hostname, port: c.port || 443, sni: c.sni || hostname, note: c.note || '' });
         }
 
-        // Generate VLESS configs for each clean IP
+        // Generate VLESS configs for each clean IP (normal + Anti-DPI twin)
         const vlessConfigs = allIPs.map(ip => {
             const host = ip.ip || hostname;
-            const vlessLink = `vless://${user.uuid}@${host}:${ip.port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${ip.sni}#VLESS-${ip.name}`;
-            return { name: ip.name, link: vlessLink, note: ip.note };
-        });
+            const base = `vless://${user.uuid}@${sgLinkHost(host)}:${ip.port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${ip.sni}`;
+            return [
+                { name: ip.name, link: `${base}#VLESS-${ip.name}`, note: ip.note },
+                { name: `${ip.name} · Anti-DPI`, link: `${base}${ANTI_DPI_PARAMS}#VLESS-${ip.name} · Anti-DPI`, note: ip.note }
+            ];
+        }).flat();
 
         return mgmtJsonResponse({
             user: {
@@ -1910,6 +1992,24 @@ async function mgmtGetBandwidthChart(env, params = {}) {
     }
 }
 
+// Per-user consumption for the admin dashboard: today + rolling 7 days.
+async function mgmtGetUsersConsumption(env) {
+    try {
+        const data = await env.DB.prepare(`
+            SELECT u.id as user_id, u.username, u.uuid,
+                   COALESCE(SUM(CASE WHEN b.date = date('now') THEN b.total_bytes END), 0) as today_bytes,
+                   COALESCE(SUM(CASE WHEN b.date >= date('now', '-6 days') THEN b.total_bytes END), 0) as week_bytes
+            FROM users u
+            LEFT JOIN bandwidth_usage b ON b.user_id = u.id
+            GROUP BY u.id, u.username, u.uuid
+            ORDER BY week_bytes DESC, today_bytes DESC
+        `).all();
+        return mgmtJsonResponse({ users: data.results || [] });
+    } catch (e) {
+        return mgmtJsonResponse({ error: 'Failed to get users consumption' }, 500);
+    }
+}
+
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
@@ -2037,7 +2137,7 @@ async function mgmtHandleRequest(request, env, ctx) {
                 }
                 const host = url.hostname;
                 const subUrl = `https://${host}/sub?token=${await MD5MD5(host + panelUser.uuid)}`;
-                const linkBase = `%PROTO%://${panelUser.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${panelUser.uuid}%3D%3D&sni=%SNI%#ShadowVPN - ${encodeURIComponent(panelUser.username || 'user')}`;
+                const linkBase = `%PROTO%://${panelUser.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${panelUser.uuid}%3D%3D&sni=%SNI%%ANTIDPI%#ShadowVPN - ${encodeURIComponent(panelUser.username || 'user')}`;
                 const protocols = typeof panelUser.protocols === 'string' ? JSON.parse(panelUser.protocols || '{}') : (panelUser.protocols || {});
                 const pData = await userPanelFetchData(env, panelUser);
                 pData.user = panelUser;
@@ -2101,7 +2201,7 @@ async function mgmtHandleRequest(request, env, ctx) {
                     if (subUA.includes('mozilla') && !wantsRaw) {
                         const host = url.hostname;
                         const panelSubUrl = `https://${host}/sub?token=${subToken}`;
-                        const linkBase = `%PROTO%://${user.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=%SNI%#ShadowVPN - ${encodeURIComponent(user.username || 'user')}`;
+                        const linkBase = `%PROTO%://${user.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=%SNI%%ANTIDPI%#ShadowVPN - ${encodeURIComponent(user.username || 'user')}`;
                         const panelProtocols = typeof user.protocols === 'string' ? JSON.parse(user.protocols || '{}') : (user.protocols || {});
                         const pData = await userPanelFetchData(env, user);
                         pData.user = user;
@@ -2136,9 +2236,11 @@ async function mgmtHandleRequest(request, env, ctx) {
                     const usedStr = fmtBytes(usedBytes);
                     const maxStr = maxBytes > 0 ? fmtBytes(maxBytes) : 'Unlimited';
 
-                    // Dummy info nodes (X-UI/Marzban style) — added at the top of configs
+                    // Dummy info nodes (X-UI/Marzban style) — added at the top of configs.
+                    // 127.0.0.1 (private) so upstream Xray accepts the security=none links;
+                    // a public IP here is rejected by validateOutboundTransportSecurity.
                     const fakeUUID = '00000000-0000-0000-0000-000000000000';
-                    const fakeIP = '1.1.1.1';
+                    const fakeIP = '127.0.0.1';
                     const daysLeft = user.expires_at
                         ? Math.max(0, Math.ceil((new Date(user.expires_at.replace(' ', 'T') + 'Z').getTime() - Date.now()) / 86400000))
                         : null;
@@ -2155,8 +2257,8 @@ async function mgmtHandleRequest(request, env, ctx) {
                         : 4102329600;
                     const subUserinfo = `upload=0; download=${usedBytes}; total=${maxBytes}; expire=${expireUnix}`;
 
-                    // Anti-DPI parameters (fragmentation + custom cipher suites)
-                    const antiDpiParams = "&fp=unsafe&cs=TLS_AES_256_GCM_SHA384%3ATLS_CHACHA20_POLY1305_SHA256%3ATLS_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256&fm=%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%22tlshello%22%2C%20%22lengths%22%3A%20%5B%225%22%2C%20%2294%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%220%22%5D%2C%20%22maxSplit%22%3A%20%220%22%7D%7D%2C%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%221-1%22%2C%20%22lengths%22%3A%20%5B%22109%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%221%22%5D%2C%20%22maxSplit%22%3A%20%22355%22%7D%7D%5D%7D";
+                    // Anti-DPI parameters (fragmentation + unsafe fp + cipher suites)
+                    const antiDpiParams = ANTI_DPI_PARAMS;
 
                     // ===== NORMAL CONFIGS (always generated, NO antiDpiParams) =====
                     // SECURITY: never emit the worker DOMAIN as connect address — users
@@ -2174,10 +2276,12 @@ async function mgmtHandleRequest(request, env, ctx) {
                         const cPort = c.port || 443;
                         const cSni = c.sni || host;
                         if (protocols.vless !== false) {
-                            configs.push(`vless://${user.uuid}@${cHost}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            configs.push(`vless://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            configs.push(`vless://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name} · Anti-DPI)`);
                         }
                         if (protocols.trojan !== false) {
-                            configs.push(`trojan://${user.uuid}@${cHost}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            configs.push(`trojan://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            configs.push(`trojan://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name} · Anti-DPI)`);
                         }
                     }
                     // Fallback: no clean IPs configured at all → one domain-443 entry so
@@ -2185,9 +2289,11 @@ async function mgmtHandleRequest(request, env, ctx) {
                     if (activeCleanIPs.length === 0) {
                         if (protocols.vless !== false) {
                             configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
+                            configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443 · Anti-DPI)`);
                         }
                         if (protocols.trojan !== false) {
                             configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
+                            configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443 · Anti-DPI)`);
                         }
                     }
 
@@ -2200,10 +2306,10 @@ async function mgmtHandleRequest(request, env, ctx) {
                             const aPort = antiClean.port || 443;
                             const aSni = antiClean.sni || host;
                             if (protocols.vless !== false) {
-                                configs.push(`vless://${user.uuid}@${aHost}:${aPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
+                                configs.push(`vless://${user.uuid}@${sgLinkHost(aHost)}:${aPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
                             }
                             if (protocols.trojan !== false) {
-                                configs.push(`trojan://${user.uuid}@${aHost}:${aPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
+                                configs.push(`trojan://${user.uuid}@${sgLinkHost(aHost)}:${aPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
                             }
                         }
                     }
@@ -2392,6 +2498,11 @@ async function mgmtHandleRequest(request, env, ctx) {
         if (path === '/api/admin/charts/bandwidth' && method === 'GET') {
             const params = { period: url.searchParams.get('period') };
             return mgmtGetBandwidthChart(env, params);
+        }
+
+        // Per-user daily / weekly consumption (dashboard card)
+        if (path === '/api/admin/users/consumption' && method === 'GET') {
+            return mgmtGetUsersConsumption(env);
         }
     }
 
@@ -2720,6 +2831,10 @@ function mgmtAdminHTML() {
                     <div style="position:relative;height:280px">
                         <canvas id="bandwidthChart" role="img" aria-label="نمودار مصرف ترافیک"></canvas>
                     </div>
+                </div>
+                <div class="chart-container" style="padding:1.25rem;max-width:920px">
+                    <div class="chart-header"><h3><svg class="icon"><use href="#i-dashboard"/></svg>مصرف کاربران (امروز / هفت روز اخیر)</h3></div>
+                    <div id="userConsumption" style="min-height:40px"><div style="color:var(--text-secondary);font-size:0.85rem">در حال بارگذاری...</div></div>
                 </div>
             </div>
 
@@ -3222,6 +3337,7 @@ function mgmtAdminHTML() {
             document.getElementById('dashboard').style.display = 'block';
             loadStats();
             loadChart();
+            loadUserConsumption();
             loadPlans();
             // Show users section by default
             showSection('users-section', document.querySelector('.nav-item'));
@@ -3234,7 +3350,7 @@ function mgmtAdminHTML() {
             if (btn) { btn.disabled = true; btn.textContent = '⏳ در حال بروزرسانی...'; }
             var activeSection = document.querySelector('.section[style*="block"], .section:not([style*="none"])');
             var activeId = activeSection ? activeSection.id : '';
-            var promises = [loadStats(), loadChart()];
+            var promises = [loadStats(), loadChart(), loadUserConsumption()];
             if (activeId === 'users-section') promises.push(loadUsers());
             else if (activeId === 'plans-section') promises.push(loadPlans());
             else if (activeId === 'connections-section') promises.push(loadConnections());
@@ -4199,8 +4315,34 @@ function mgmtAdminHTML() {
             return new Intl.NumberFormat('fa-IR').format(price) + ' ریال';
         }
 
+        // Per-user consumption rows (name + today + rolling 7 days + relative bar)
+        async function loadUserConsumption() {
+            try {
+                const r = await fetch('/api/admin/users/consumption', {headers: {'Authorization': 'Bearer ' + token}});
+                const d = await r.json();
+                const box = document.getElementById('userConsumption');
+                if (!box) return;
+                const rows = d.users || [];
+                if (!rows.length) {
+                    box.innerHTML = '<div style="color:var(--text-secondary);font-size:0.85rem">کاربری ثبت نشده</div>';
+                    return;
+                }
+                const esc = function(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); };
+                const maxWeek = Math.max(1, ...rows.map(function(u) { return u.week_bytes || 0; }));
+                box.innerHTML = rows.map(function(u) {
+                    const pct = Math.round(((u.week_bytes || 0) / maxWeek) * 100);
+                    return '<div style="display:flex;align-items:center;gap:0.75rem;padding:0.55rem 0;border-bottom:1px solid var(--border)">' +
+                        '<span style="min-width:110px;max-width:170px;font-weight:700;font-size:0.88rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(u.username) + '">' + esc(u.username) + '</span>' +
+                        '<span style="min-width:104px;font-size:0.8rem;color:var(--text-secondary)">امروز: <b style="color:var(--accent)">' + formatBytes(u.today_bytes || 0) + '</b></span>' +
+                        '<span style="min-width:132px;font-size:0.8rem;color:var(--text-secondary)">هفت روز: <b style="color:var(--text-primary)">' + formatBytes(u.week_bytes || 0) + '</b></span>' +
+                        '<span style="flex:1;min-width:60px;background:var(--bg-tertiary);border-radius:6px;height:8px;overflow:hidden;display:block"><span style="display:block;height:100%;width:' + Math.max(2, pct) + '%;background:linear-gradient(90deg,#38bdf8,#818cf8);border-radius:6px"></span></span>' +
+                        '</div>';
+                }).join('');
+            } catch (e) { console.error('User consumption error:', e); }
+        }
+
         // Init chart on dashboard load
-        setTimeout(() => { if (token) loadChart(); }, 500);
+        setTimeout(() => { if (token) { loadChart(); loadUserConsumption(); } }, 500);
     </script>
 </body>
 </html>`;
@@ -4438,6 +4580,16 @@ function userPanelFormatBytes(b) {
     return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// Persian label for a daily-usage column: امروز / دیروز / short weekday (شنبه..جمعه).
+function userPanelDayLabel(dateStr, todayStr) {
+    if (dateStr === todayStr) return 'امروز';
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    if (dateStr === yesterday) return 'دیروز';
+    const shortNames = ['یک', 'دو', 'سه', 'چهار', 'پنج', 'جمعه', 'شنبه'];
+    const wd = new Date(dateStr + 'T00:00:00Z').getUTCDay();
+    return shortNames[wd];
+}
+
 function userPanelHTML(data) {
     const esc = userPanelEscapeHtml;
     const fmt = userPanelFormatBytes;
@@ -4446,7 +4598,7 @@ function userPanelHTML(data) {
     const maxBW = data.maxBW;
     const usedBW = data.usedBW;
     const percent = maxBW > 0 ? Math.min(100, Math.round((usedBW / maxBW) * 100)) : 0;
-    const bwClass = percent >= 90 ? 'danger' : percent >= 70 ? 'warning' : '';
+    const bwClass = percent >= 90 ? 'dg' : percent >= 70 ? 'wn' : 'ok';
     const expired = u.expires_at && u.expires_at <= data.now;
     const frozen = u.is_frozen === 1;
     const active = u.is_active === 1 && !expired && !frozen;
@@ -4454,205 +4606,494 @@ function userPanelHTML(data) {
         ? Math.max(0, Math.ceil((new Date(u.expires_at.replace(' ', 'T') + 'Z').getTime() - Date.now()) / 86400000))
         : null;
     const protocols = data.protocols;
+    const warnDays = daysLeft !== null && daysLeft <= 3 && !expired;
+    const remBW = Math.max(0, maxBW - usedBW);
+    const tStart = Date.parse(String(u.start_date || u.created_at || '').replace(' ', 'T') + 'Z');
+    const tEnd = u.expires_at ? Date.parse(u.expires_at.replace(' ', 'T') + 'Z') : NaN;
+    const hasStart = !isNaN(tStart) && !isNaN(tEnd) && tEnd > tStart;
+    const tSpan = hasStart ? tEnd - tStart : 30 * 86400000;
+    const timePct = isNaN(tEnd) ? null : Math.max(0, Math.min(100, Math.round((Date.now() - (hasStart ? tStart : tEnd - tSpan)) / tSpan * 100)));
+    const timeTotal = hasStart ? Math.round(tSpan / 86400000) : null;
+    const timeClass = daysLeft === null ? 'ok' : daysLeft <= 3 ? 'dg' : daysLeft <= 7 ? 'wn' : 'ok';
 
-    // Build node list client-side data (JSON, injected safely)
+    // Build node list client-side data (JSON, injected safely).
+    // Every node is emitted twice: plain + Anti-DPI (fp=unsafe / cs / fm trio).
     const nodes = [];
+    const pushNode = (name, proto, port, sni, host) => {
+        const base = data.linkBase.replace('%PROTO%', proto).replace('%PORT%', port).replace('%SNI%', sni).replace('%HOST%', sgLinkHost(host));
+        nodes.push({ name: name, link: base.replace('%ANTIDPI%', '') });
+        nodes.push({ name: name + ' · Anti-DPI', link: base.replace('%ANTIDPI%', ANTI_DPI_PARAMS) });
+    };
     if (protocols.vless !== false || protocols.trojan !== false) {
         for (const port of ['443', '2053', '2096']) {
-            if (protocols.vless !== false) nodes.push({ name: 'VLESS · CDN · ' + port, link: data.linkBase.replace('%PROTO%', 'vless').replace('%PORT%', port).replace('%SNI%', data.host).replace('%HOST%', data.host) });
-            if (protocols.trojan !== false) nodes.push({ name: 'Trojan · CDN · ' + port, link: data.linkBase.replace('%PROTO%', 'trojan').replace('%PORT%', port).replace('%SNI%', data.host).replace('%HOST%', data.host) });
+            if (protocols.vless !== false) pushNode('VLESS · CDN · ' + port, 'vless', port, data.host, data.host);
+            if (protocols.trojan !== false) pushNode('Trojan · CDN · ' + port, 'trojan', port, data.host, data.host);
         }
     }
     for (const c of data.cleanIPs) {
         const cHost = c.ip || data.host, cPort = c.port || 443, cSni = c.sni || data.host;
-        if (protocols.vless !== false) nodes.push({ name: 'VLESS · ' + c.name + ' · ' + cPort, link: data.linkBase.replace('%PROTO%', 'vless').replace('%PORT%', String(cPort)).replace('%SNI%', cSni).replace('%HOST%', cHost) });
-        if (protocols.trojan !== false) nodes.push({ name: 'Trojan · ' + c.name + ' · ' + cPort, link: data.linkBase.replace('%PROTO%', 'trojan').replace('%PORT%', String(cPort)).replace('%SNI%', cSni).replace('%HOST%', cHost) });
+        if (protocols.vless !== false) pushNode('VLESS · ' + c.name + ' · ' + cPort, 'vless', String(cPort), cSni, cHost);
+        if (protocols.trojan !== false) pushNode('Trojan · ' + c.name + ' · ' + cPort, 'trojan', String(cPort), cSni, cHost);
     }
 
-    const maxDaily = Math.max(1, ...data.daily.map(d => d.total_bytes || 0));
+    // Last 7 UTC calendar days, zero-filled — idle days still show as 0.
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const dailyMap = {};
+    (data.daily || []).forEach(d => { dailyMap[d.date] = d; });
+    const chartDays = [];
+    for (let i = 6; i >= 0; i--) {
+        const ds = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+        const row = dailyMap[ds];
+        chartDays.push({
+            date: ds,
+            total_bytes: row ? (row.total_bytes || 0) : 0,
+            bytes_up: row ? (row.bytes_up || 0) : 0,
+            bytes_down: row ? (row.bytes_down || 0) : 0,
+            request_count: row ? (row.request_count || 0) : 0
+        });
+    }
+    const todayRow = chartDays[chartDays.length - 1];
+    const maxDaily = Math.max(1, ...chartDays.map(d => d.total_bytes || 0));
+
+    // ---- SVG chart geometry (custom, no library) ----
+    const CH_W = 350, CH_H = 130, CH_BASE = 116, CH_MAXH = 100, COL_W = 42, COL_GAP = 8;
+    const COL_X0 = (CH_W - (7 * COL_W + 6 * COL_GAP)) / 2;
+    const cols = chartDays.map((d, i) => {
+        const h = Math.max(2, Math.round(((d.total_bytes || 0) / maxDaily) * CH_MAXH));
+        const x = COL_X0 + i * (COL_W + COL_GAP);
+        return { d: d, i: i, x: x, y: CH_BASE - h, h: h, cx: x + COL_W / 2 };
+    });
+
+    // Status badge (live pulse dot)
+    const badge = active
+        ? '<span class="badge b-ok"><i class="pulse"></i>اشتراک فعال</span>'
+        : frozen
+            ? '<span class="badge b-wn"><i class="pulse"></i>اشتراک فریز شده</span>'
+            : expired
+                ? '<span class="badge b-no"><i class="pulse"></i>اشتراک منقضی</span>'
+                : '<span class="badge b-no"><i class="pulse"></i>اشتراک غیرفعال</span>';
 
     return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#080c18">
+<meta name="theme-color" content="#06040f">
 <title>ShadowVPN — پنل کاربری</title>
 <style>
-:root{--bg:#080c18;--bg2:#101726;--tx:#f1f5f9;--tx2:#94a3b8;--tx3:#64748b;--ac:#38bdf8;--ac2:#818cf8;--ok:#34d399;--wn:#fbbf24;--dg:#f87171;--bd:rgba(148,163,184,.14);--bd2:rgba(148,163,184,.28);--glass:rgba(19,27,46,.58);--glass-hi:rgba(30,42,72,.55);--glass-deep:rgba(11,16,30,.72);--r:18px;--rs:11px;--sh:0 18px 55px -18px rgba(0,0,0,.7);--glow:0 0 24px -6px rgba(56,189,248,.45)}
+/* ============ design tokens ============ */
+:root{
+  --bg:#06040f; --bg2:#0e0826; --panel-a:#1c1444; --panel-b:#0f0a28;
+  --tx:#f5f3ff; --tx2:#a5a3c2; --tx3:#7e7ca8;
+  --ac:#38d0f8; --ac2:#b392ff; --ok:#2ee6a6; --wn:#ffc14d; --dg:#ff6b81;
+  --bd:rgba(150,143,200,.17); --bd2:rgba(150,143,200,.32);
+  --r:20px; --rs:14px; --rp:999px;
+  --sh-1:0 1px 2px rgba(0,0,0,.45);
+  --sh-2:0 14px 34px -14px rgba(0,0,0,.7);
+  --z-au:0; --z-wrap:1; --z-toast:60; --z-modal:80;
+  --d-fast:170ms; --d-med:320ms; --d-slow:560ms;
+  --e-out:cubic-bezier(.2,.8,.2,1); --e-spring:cubic-bezier(.2,1.35,.4,1);
+  --sp-1:.5rem; --sp-2:.85rem; --sp-3:1.25rem; --sp-4:1.75rem;
+}
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{overflow-x:hidden}
 html{scrollbar-color:rgba(148,163,184,.3) transparent}
 ::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:rgba(148,163,184,.25);border-radius:8px}
 @font-face{font-family:Vazirmatn;src:url(https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/webfonts/Vazirmatn-Regular.woff2) format('woff2');font-weight:400;font-display:swap}
 @font-face{font-family:Vazirmatn;src:url(https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/webfonts/Vazirmatn-Bold.woff2) format('woff2');font-weight:700;font-display:swap}
 @font-face{font-family:Vazirmatn;src:url(https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/webfonts/Vazirmatn-Black.woff2) format('woff2');font-weight:900;font-display:swap}
-body{font-family:Vazirmatn,'Segoe UI',Tahoma,sans-serif;color:var(--tx);min-height:100vh;background:linear-gradient(160deg,#080c18,#0b1428 48%,#080c18);background-attachment:fixed}
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(1150px 540px at 85% -10%,rgba(56,189,248,.20),transparent 62%),radial-gradient(900px 520px at 5% 12%,rgba(52,211,153,.10),transparent 60%),radial-gradient(1000px 500px at 10% 110%,rgba(129,140,248,.18),transparent 60%),radial-gradient(720px 430px at 96% 72%,rgba(56,189,248,.08),transparent 60%)}
-body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(rgba(148,163,184,.055) 1px,transparent 1.4px);background-size:26px 26px;-webkit-mask-image:radial-gradient(ellipse 95% 75% at 50% 28%,#000 30%,transparent 80%);mask-image:radial-gradient(ellipse 95% 75% at 50% 28%,#000 30%,transparent 80%)}
-@keyframes up{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
-.wrap{max-width:760px;margin:0 auto;padding:1.2rem 1rem 3rem;position:relative;z-index:1}
-.hero{text-align:center;padding:1.9rem .5rem 1.4rem;animation:up .45s ease both}
-.hero h1{font-size:1.5rem;font-weight:900;letter-spacing:.2px;background:linear-gradient(120deg,#7dd3fc,var(--ac) 45%,var(--ac2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;display:inline-flex;align-items:center;gap:.55rem;filter:drop-shadow(0 0 14px rgba(56,189,248,.35))}
-.hero h1 svg{width:1.65em;height:1.65em;-webkit-text-fill-color:initial}
-.hero .sub{color:var(--tx2);font-size:.88rem;margin-top:.35rem;font-weight:500}
-.badge{display:inline-flex;align-items:center;gap:.35rem;padding:.3rem .75rem;border-radius:999px;font-size:.78rem;font-weight:700;margin-top:.7rem}
-.b-ok{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
-.b-no{background:rgba(248,113,113,.14);color:var(--dg);border:1px solid rgba(248,113,113,.35)}
-.b-wn{background:rgba(251,191,36,.14);color:var(--wn);border:1px solid rgba(251,191,36,.35)}
-.card{background:linear-gradient(165deg,var(--glass-hi),var(--glass-deep) 62%);backdrop-filter:blur(20px) saturate(1.35);-webkit-backdrop-filter:blur(20px) saturate(1.35);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh),inset 0 1px 0 rgba(255,255,255,.08),inset 0 -14px 26px -20px rgba(56,189,248,.28);padding:1.25rem;margin-bottom:1rem;animation:up .45s ease both}
-.card h2{font-size:.95rem;font-weight:700;color:var(--tx2);margin-bottom:1rem;display:flex;align-items:center;gap:.5rem;letter-spacing:.1px}
-.card h2 svg{width:1.15em;height:1.15em;color:var(--ac)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}
-@media(min-width:560px){.grid{grid-template-columns:repeat(3,1fr)}}
-.cell{background:linear-gradient(170deg,rgba(35,48,80,.55),rgba(10,14,26,.68));border:1px solid var(--bd);border-radius:var(--rs);padding:.85rem .8rem;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 6px 18px -10px rgba(0,0,0,.6);transition:border-color .25s,box-shadow .25s}
-.cell:hover{border-color:rgba(56,189,248,.35);box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 8px 22px -10px rgba(56,189,248,.35)}
-.cell h4{color:var(--tx3);font-size:.7rem;font-weight:600;margin-bottom:.4rem}
-.cell .v{color:var(--ac);font-weight:800;font-size:1.05rem;font-variant-numeric:tabular-nums}
-.cell .v.ok{color:var(--ok)}.cell .v.wn{color:var(--wn)}.cell .v.dg{color:var(--dg)}
-.progress{height:8px;background:rgba(148,163,184,.14);border-radius:999px;overflow:hidden;margin-top:.8rem}
-.pbar{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--ac2) 70%,var(--ok));box-shadow:0 0 12px -2px rgba(56,189,248,.8);transition:width .5s cubic-bezier(.2,.8,.3,1);position:relative}
-.pbar::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);background-size:200% 100%;animation:sheen 2.6s linear infinite}
-@keyframes sheen{to{background-position:-200% 0}}
-.pbar.warning{background:linear-gradient(90deg,#fbbf24,#f59e0b);box-shadow:0 0 10px -2px rgba(251,191,36,.7)}
-.pbar.danger{background:linear-gradient(90deg,#f87171,#ef4444);box-shadow:0 0 10px -2px rgba(248,113,113,.7)}
-.plabel{text-align:center;font-size:.75rem;color:var(--tx2);margin-top:.4rem}
-.chart{display:flex;align-items:flex-end;gap:6px;height:110px;margin-top:.5rem}
-.bar{flex:1;background:linear-gradient(180deg,#7dd3fc,var(--ac) 55%,rgba(129,140,248,.55));border-radius:6px 6px 2px 2px;min-height:3px;position:relative;opacity:.9;box-shadow:0 0 12px -4px rgba(56,189,248,.6)}
-.bar:hover{opacity:1}
-.bar span{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);font-size:.6rem;color:var(--tx3);white-space:nowrap;opacity:0;transition:opacity .2s}
-.bar:hover span{opacity:1}
-.xlab{display:flex;gap:6px;margin-top:.35rem}
-.xlab div{flex:1;text-align:center;font-size:.62rem;color:var(--tx3)}
-.subbox{background:linear-gradient(170deg,rgba(30,44,74,.75),rgba(10,14,26,.85));border:1px solid var(--bd);border-radius:var(--rs);padding:.75rem;font-family:ui-monospace,monospace;font-size:.72rem;word-break:break-all;color:#a5f3fc;direction:ltr;text-align:left;box-shadow:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 24px -10px rgba(56,189,248,.45)}
-@property --beam{syntax:'<angle>';initial-value:0deg;inherits:false}
-.beam{position:relative;transition:transform .15s ease}
-.beam::before{content:'';position:absolute;inset:-2px;border-radius:12px;padding:2px;background:conic-gradient(from var(--beam),transparent 0deg,transparent 248deg,#38bdf8 288deg,#818cf8 308deg,#34d399 328deg,transparent 360deg);-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;animation:beamspin 3.6s linear infinite,beampulse 3.6s ease-in-out infinite;pointer-events:none}
-#subLink{cursor:pointer}
-#subLink:active{transform:scale(.985)}
-.beam.card{cursor:default}
-.beam.card::before{border-radius:20px}
-.wrap>.card.beam:nth-of-type(even)::before{animation-delay:-1.8s}
-@keyframes beampulse{0%,100%{opacity:.55}22%{opacity:1}45%{opacity:.6}}
-.appsframe{position:relative;border-radius:17px}
-.appsframe::before{content:'';position:absolute;inset:-2px;border-radius:18px;padding:1px;background:linear-gradient(135deg,rgba(56,189,248,.30),rgba(129,140,248,.30));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;pointer-events:none}
-@keyframes beamspin{to{--beam:360deg}}
-@media (prefers-reduced-motion:reduce){.beam::before{animation:none}}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;padding:.55rem 1rem;border:1px solid var(--bd);border-radius:10px;cursor:pointer;font-size:.83rem;font-weight:600;color:var(--tx);background:rgba(31,41,55,.6);transition:transform .15s,box-shadow .2s,filter .2s;margin:.15rem}
-.btn:hover{transform:translateY(-1px)}
-.btn-p{background:linear-gradient(135deg,rgba(56,189,248,.9),rgba(129,140,248,.9));color:#071018;border:none;box-shadow:var(--glow)}
-.btn-p:hover{filter:brightness(1.1)}
-.btn-o{background:transparent}
+body{font-family:Vazirmatn,'Segoe UI',Tahoma,system-ui,sans-serif;color:var(--tx);min-height:100vh;background:linear-gradient(180deg,#06040f 0%,#0f0826 50%,#080512 100%);background-attachment:fixed;font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased}
+/* slow aurora (transform/opacity only) */
+.au{position:fixed;inset:-12%;z-index:var(--z-au);pointer-events:none;overflow:hidden}
+.au i{position:absolute;display:block;border-radius:50%}
+.au .a1{width:75vmax;height:75vmax;top:-30vmax;right:-25vmax;background:radial-gradient(closest-side,rgba(34,211,238,.22),transparent 70%);animation:drift1 46s ease-in-out infinite alternate}
+.au .a2{width:65vmax;height:65vmax;bottom:-28vmax;left:-22vmax;background:radial-gradient(closest-side,rgba(139,92,246,.24),transparent 70%);animation:drift2 58s ease-in-out infinite alternate}
+.au .a3{width:40vmax;height:40vmax;top:38%;left:44%;background:radial-gradient(closest-side,rgba(192,132,252,.14),transparent 70%);animation:drift1 64s ease-in-out infinite alternate-reverse}
+.au .a4{width:150vmax;height:42vmax;bottom:-24vmax;left:-25vmax;background:radial-gradient(closest-side,rgba(139,92,246,.20),rgba(34,211,238,.08) 55%,transparent 75%);animation:drift2 70s ease-in-out infinite alternate}
+@keyframes drift1{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-6vmax,5vmax,0) scale(1.12)}}
+@keyframes drift2{from{transform:translate3d(0,0,0) scale(1.08)}to{transform:translate3d(5vmax,-4vmax,0) scale(1)}}
+.dots{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(rgba(150,143,205,.06) 1px,transparent 1.4px);background-size:26px 26px;-webkit-mask-image:radial-gradient(ellipse 95% 72% at 50% 24%,#000 30%,transparent 80%);mask-image:radial-gradient(ellipse 95% 72% at 50% 24%,#000 30%,transparent 80%)}
+.wrap{max-width:800px;margin:0 auto;padding:calc(var(--sp-3) + env(safe-area-inset-top)) 1rem calc(3rem + env(safe-area-inset-bottom));position:relative;z-index:var(--z-wrap)}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px;border-radius:8px}
+/* staggered reveal: transform + opacity (hero gets the blur accent) */
+.rv{animation:rvIn var(--d-slow) var(--e-out) both;animation-delay:var(--d,0s)}
+@keyframes rvIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+.hero.rv{animation-name:rvHero}
+@keyframes rvHero{from{opacity:0;transform:translateY(12px);filter:blur(8px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
+/* ============ hero ============ */
+.hero{text-align:center;padding:1.4rem .5rem 1.6rem}
+.hero .logo{width:64px;height:64px;margin:0 auto .8rem;display:block;filter:drop-shadow(0 6px 18px rgba(56,208,248,.35))}
+.hero h1{font-size:1.65rem;font-weight:900;letter-spacing:.2px;line-height:1.45;background:linear-gradient(120deg,#38d0f8,var(--ac) 48%,#c084fc);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hero .hsub{color:var(--tx2);font-size:.84rem;font-weight:500;margin-top:.15rem}
+.badge{display:inline-flex;align-items:center;gap:.5rem;padding:.34rem .9rem;border-radius:var(--rp);font-size:.8rem;font-weight:700;margin-top:.85rem;position:relative}
+.b-ok{background:rgba(46,230,166,.13);color:var(--ok);border:1px solid rgba(46,230,166,.38)}
+.b-no{background:rgba(255,107,129,.13);color:var(--dg);border:1px solid rgba(255,107,129,.38)}
+.b-wn{background:rgba(255,193,77,.13);color:var(--wn);border:1px solid rgba(255,193,77,.38)}
+.pulse{width:.55rem;height:.55rem;border-radius:50%;background:currentColor;position:relative;flex-shrink:0}
+.pulse::after{content:'';position:absolute;inset:0;border-radius:50%;background:currentColor;animation:pulse 2s var(--e-out) infinite}
+@keyframes pulse{0%{transform:scale(1);opacity:.7}70%{transform:scale(2.6);opacity:0}100%{transform:scale(2.6);opacity:0}}
+/* ============ cards ============ */
+.card{position:relative;background:linear-gradient(165deg,var(--panel-a),var(--panel-b) 68%);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh-2),inset 0 1px 0 rgba(255,255,255,.07);padding:var(--sp-3);margin-bottom:1rem;overflow:hidden}
+@property --neon{syntax:'<angle>';initial-value:0deg;inherits:false}
+.card::before{content:'';position:absolute;inset:0;border-radius:inherit;padding:1.5px;background:conic-gradient(from var(--neon),transparent 0 252deg,#38d0f8 288deg,#b392ff 320deg,transparent 360deg);-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;opacity:0;transition:opacity .3s var(--e-out);pointer-events:none;animation:neonspin 5.5s linear infinite;animation-play-state:paused;filter:drop-shadow(0 0 5px rgba(56,208,248,.65))}
+.card:hover::before{opacity:1;animation-play-state:running}
+@keyframes neonspin{to{--neon:360deg}}
+.card:hover{box-shadow:var(--sh-2),inset 0 1px 0 rgba(255,255,255,.07),0 0 26px -10px rgba(56,208,248,.55),0 0 26px -10px rgba(179,146,255,.4)}
+.card::after{content:'';position:absolute;inset:0;border-radius:inherit;background:radial-gradient(260px circle at var(--px,50%) var(--py,0%),rgba(56,208,248,.09),transparent 62%);opacity:0;transition:opacity var(--d-med) var(--e-out);pointer-events:none}
+.card:hover::after{opacity:1}
+.card h2{font-size:.95rem;font-weight:700;color:var(--tx2);margin-bottom:1rem;display:flex;align-items:center;gap:.55rem;letter-spacing:.1px;position:relative;z-index:1}
+.card h2 .ic{width:1.15em;height:1.15em;color:var(--ac);flex-shrink:0}
+.card h2 .aside{margin-inline-start:auto;font-size:.72rem;font-weight:700;background:rgba(255,193,77,.12);border:1px solid rgba(255,193,77,.35);color:var(--wn);padding:.16rem .55rem;border-radius:9px;white-space:nowrap}
+/* ============ usage: ring + tiles ============ */
+.usage{display:flex;flex-direction:column;gap:1.1rem;position:relative;z-index:1}
+@media(min-width:560px){.usage{flex-direction:row-reverse;align-items:center;gap:1.5rem}}
+.ringwrap{position:relative;width:168px;height:168px;margin:0 auto;flex-shrink:0}
+.ring{width:100%;height:100%;display:block}
+.ring .trk{fill:none;stroke:rgba(148,163,184,.15);stroke-width:9}
+.ring .bar{fill:none;stroke-width:9;stroke-linecap:round;transform:rotate(-90deg);transform-origin:64px 64px;transition:stroke-dashoffset 1.1s var(--e-out)}
+.ring .bar.ok{stroke:url(#gr-ok)}.ring .bar.wn{stroke:url(#gr-wn)}.ring .bar.dg{stroke:url(#gr-dg)}
+.ringwrap.ok .ring .bar{filter:drop-shadow(0 0 7px rgba(46,230,166,.5))}
+.ringwrap.wn .ring .bar{filter:drop-shadow(0 0 7px rgba(255,193,77,.5))}
+.ringwrap.dg .ring .bar{filter:drop-shadow(0 0 7px rgba(255,107,129,.5))}
+.ring .trk.inf{stroke:rgba(179,146,255,.4);stroke-dasharray:3 7}
+.ringc{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
+.ringc b{font-size:2rem;font-weight:900;font-variant-numeric:tabular-nums;letter-spacing:.5px;line-height:1.1}
+.ringc b .pc{font-size:1.1rem;font-weight:700;opacity:.75}
+.ringc small{font-size:.7rem;color:var(--tx3);font-weight:600;margin-top:.15rem}
+.ringc .biginf{font-size:2.6rem;font-weight:900;line-height:1;background:linear-gradient(120deg,var(--ac2),var(--ac));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.tiles{display:grid;grid-template-columns:repeat(2,1fr);gap:.6rem;flex:1}
+@media(min-width:480px){.tiles{grid-template-columns:repeat(3,1fr)}}
+.tile{background:linear-gradient(170deg,rgba(60,50,126,.52),rgba(15,11,38,.7));border:1px solid var(--bd);border-radius:var(--rs);padding:.75rem .7rem;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.06);transition:border-color var(--d-fast) var(--e-out),transform var(--d-fast) var(--e-out)}
+.tile:hover{border-color:rgba(56,208,248,.35);transform:translateY(-2px)}
+.tile .tico{width:1.5rem;height:1.5rem;color:var(--ac2);opacity:.85;margin:0 auto .3rem;display:block}
+.tile h4{color:var(--tx3);font-size:.68rem;font-weight:600;margin-bottom:.28rem}
+.tile .tv{font-weight:800;font-size:1.02rem;font-variant-numeric:tabular-nums;color:var(--tx);line-height:1.4;word-break:break-word}
+.tile .tv small{color:var(--tx3);font-size:.66em;font-weight:600}
+.tile .tv.ok{color:var(--ok)}.tile .tv.wn{color:var(--wn)}.tile .tv.dg{color:var(--dg)}
+.tile .tv .inf{display:inline-flex;align-items:center;justify-content:center;min-width:2rem;padding:.05rem .5rem;border-radius:9px;font-weight:900;background:linear-gradient(120deg,rgba(56,208,248,.16),rgba(179,146,255,.2));border:1px solid rgba(179,146,255,.4);color:#d3c6ff}
+.tile.warn{border-color:rgba(255,193,77,.45);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 0 14px -6px rgba(255,193,77,.55)}
+.tile.warn .tv{color:var(--wn)}
+.bwfoot{position:relative;z-index:1;display:flex;align-items:center;gap:.7rem;margin-top:1rem}
+.track{flex:1;height:7px;background:rgba(148,163,184,.14);border-radius:var(--rp);overflow:hidden}
+.fill{height:100%;border-radius:var(--rp);background:linear-gradient(90deg,var(--ac),var(--ac2) 75%,#d3c6ff);box-shadow:0 0 10px -2px rgba(56,208,248,.7);transition:width 1s var(--e-out) .2s}
+.fill.wn{background:linear-gradient(90deg,#ffc14d,#f59e0b);box-shadow:0 0 10px -2px rgba(255,193,77,.6)}
+.fill.dg{background:linear-gradient(90deg,#ff6b81,#ef4444);box-shadow:0 0 10px -2px rgba(255,107,129,.6)}
+.bwfoot .pct{font-size:.78rem;font-weight:800;font-variant-numeric:tabular-nums;color:var(--tx2);min-width:3.2em;text-align:left}
+/* ============ subscription ============ */
+.subrow{background:linear-gradient(170deg,rgba(58,44,132,.72),rgba(15,11,38,.86));border:1px solid var(--bd);border-radius:var(--rs);padding:.85rem .9rem;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.07);transition:transform var(--d-fast) var(--e-out),border-color var(--d-fast);position:relative;z-index:1}
+.subrow:active{transform:scale(.985)}
+.subrow:focus-visible{border-color:var(--ac)}
+.subtxt{display:block;font-family:ui-monospace,'SF Mono',Consolas,monospace;font-size:.78rem;letter-spacing:.2px;color:#d6ecff;direction:ltr;text-align:center;word-break:break-all;user-select:all}
+.btnrow{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.85rem;justify-content:center;position:relative;z-index:1}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.45rem;min-height:44px;padding:.55rem 1.05rem;border:1px solid var(--bd);border-radius:12px;cursor:pointer;font-size:.85rem;font-weight:700;font-family:inherit;color:var(--tx);background:rgba(40,36,86,.55);transition:transform var(--d-fast) var(--e-out),box-shadow var(--d-med),filter var(--d-med),border-color var(--d-fast);position:relative;overflow:hidden;text-decoration:none}
+.btn:hover{transform:translateY(-1px);border-color:var(--bd2)}
+.btn:active{transform:translateY(0) scale(.97)}
 .btn svg{width:1.05em;height:1.05em;flex-shrink:0}
-.apps{display:grid;grid-template-columns:repeat(2,1fr);gap:.5rem}
+.btn-p{background:linear-gradient(135deg,rgba(56,208,248,.92),rgba(179,146,255,.92));color:#071018;border:none;box-shadow:0 0 24px -8px rgba(56,208,248,.55)}
+.btn-p:hover{filter:brightness(1.08)}
+.btn .ic-tick{display:none}
+.btn.copied .ic-copy{display:none}
+.btn.copied .ic-tick{display:block;animation:tickPop .35s var(--e-spring) both}
+@keyframes tickPop{from{transform:scale(.3);opacity:0}to{transform:scale(1);opacity:1}}
+.ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,.45);transform:scale(0);opacity:.8;pointer-events:none;animation:rip .5s var(--e-out) forwards}
+@keyframes rip{to{transform:scale(2.6);opacity:0}}
+/* ============ apps ============ */
+.apps{display:grid;grid-template-columns:repeat(2,1fr);gap:.6rem;position:relative;z-index:1}
 @media(min-width:480px){.apps{grid-template-columns:repeat(3,1fr)}}
-.app-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.25rem;padding:.8rem .5rem;border-radius:12px;cursor:pointer;text-decoration:none;color:var(--tx);background:rgba(148,163,184,.08);backdrop-filter:blur(10px) saturate(1.2);-webkit-backdrop-filter:blur(10px) saturate(1.2);border:1px solid var(--bd);transition:background .25s,color .25s,border-color .25s,box-shadow .25s,transform .15s}
-.app-btn:hover{background:linear-gradient(135deg,rgba(56,189,248,.9),rgba(129,140,248,.9));color:#071018;border-color:transparent;box-shadow:0 0 26px -6px rgba(56,189,248,.65);transform:translateY(-2px)}
-.app-btn:active{transform:translateY(0)}
-.node{background:linear-gradient(170deg,rgba(35,48,80,.55),rgba(10,14,26,.68));border:1px solid var(--bd);border-radius:var(--rs);padding:.7rem .8rem;margin-bottom:.55rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 6px 18px -10px rgba(0,0,0,.6)}
-.node .row{display:flex;justify-content:space-between;align-items:center;gap:.5rem}
-.node .nm{color:#7dd3fc;font-weight:700;font-size:.82rem;letter-spacing:.1px}
-.node .lk{font-family:ui-monospace,monospace;font-size:.62rem;color:var(--tx3);word-break:break-all;margin-top:.35rem;max-height:2.4em;overflow:hidden;direction:ltr;text-align:left}
-.node .acts{display:flex;gap:.3rem;flex-shrink:0}
-.btn-xs{padding:.3rem .5rem;font-size:.72rem;border-radius:8px}
-.modal{display:none;position:fixed;inset:0;background:rgba(4,8,16,.78);backdrop-filter:blur(6px);z-index:100;justify-content:center;align-items:center;padding:1rem}
+.app-btn{display:flex;align-items:center;gap:.65rem;min-height:56px;padding:.65rem .7rem;border-radius:14px;cursor:pointer;text-decoration:none;color:var(--tx);background:rgba(140,130,210,.08);border:1px solid var(--bd);transition:transform var(--d-fast) var(--e-out),border-color var(--d-fast),box-shadow var(--d-med),background var(--d-fast)}
+.app-btn:hover{transform:translateY(-2px);border-color:rgba(56,208,248,.4);box-shadow:0 10px 22px -12px rgba(56,208,248,.5);background:rgba(56,208,248,.07)}
+.app-btn:active{transform:translateY(0) scale(.98)}
+.app-btn .mono{width:2.15rem;height:2.15rem;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.8rem;flex-shrink:0;background:linear-gradient(135deg,rgba(56,208,248,.2),rgba(179,146,255,.22));border:1px solid rgba(179,146,255,.35);color:#bdefff;letter-spacing:-.4px}
+.app-btn .meta{display:flex;flex-direction:column;min-width:0;text-align:right}
+.app-btn .an{font-weight:800;font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.app-btn .ap{font-size:.64rem;color:var(--tx3);background:rgba(148,163,184,.12);border-radius:99px;padding:.02rem .5rem;align-self:flex-start;margin-top:.2rem}
+.app-note{font-size:.72rem;color:var(--tx3);margin-top:.75rem;text-align:center;position:relative;z-index:1}
+.app-lead{font-size:.76rem;color:var(--tx2);margin-bottom:.85rem;text-align:center;line-height:1.8;position:relative;z-index:1}
+/* ============ configs accordion ============ */
+.cfg-h{cursor:pointer;user-select:none;background:none;border:none;font:inherit;color:inherit;width:100%;text-align:right;min-height:44px}
+.cfg-h .cnt{font-size:.72rem;font-weight:800;color:var(--ac2);background:rgba(179,146,255,.14);border:1px solid rgba(179,146,255,.35);border-radius:99px;padding:.05rem .55rem}
+.cfg-h .chev{width:1.05rem;height:1.05rem;margin-inline-start:auto;color:var(--ac);transition:transform var(--d-med) var(--e-out);flex-shrink:0}
+.cfg-h[aria-expanded="true"] .chev{transform:rotate(180deg)}
+.cfg-drawer{display:grid;grid-template-rows:0fr;transition:grid-template-rows .38s var(--e-out)}
+.cfg-drawer.open{grid-template-rows:1fr}
+.cfg-inner{overflow:hidden;min-height:0}
+.node{background:linear-gradient(170deg,rgba(60,50,126,.52),rgba(15,11,38,.7));border:1px solid var(--bd);border-radius:var(--rs);padding:.7rem .8rem;margin-bottom:.55rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);opacity:0;transform:translateY(6px);animation:nodeIn .4s var(--e-out) forwards;animation-delay:var(--nd,0s)}
+@keyframes nodeIn{to{opacity:1;transform:translateY(0)}}
+.node:last-child{margin-bottom:0}
+.node .row{display:flex;align-items:center;gap:.5rem}
+.node .nm{font-weight:700;font-size:.82rem;color:#bdefff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.tagchip{font-size:.6rem;font-weight:800;padding:.06rem .45rem;border-radius:99px;flex-shrink:0;letter-spacing:.2px}
+.tagchip.plain{background:rgba(56,208,248,.13);color:var(--ac);border:1px solid rgba(56,208,248,.35)}
+.tagchip.dpi{background:rgba(179,146,255,.15);color:#d3c6ff;border:1px solid rgba(179,146,255,.4)}
+.node .acts{display:flex;gap:.35rem;flex-shrink:0}
+.btn-xs{min-height:34px;padding:.3rem .6rem;font-size:.74rem;border-radius:9px;background:rgba(148,163,184,.08)}
+@media(pointer:coarse){.btn-xs{min-height:44px;padding:.4rem .75rem}}
+.node .lk{font-family:ui-monospace,'SF Mono',Consolas,monospace;font-size:.62rem;color:var(--tx3);margin-top:.4rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:left}
+.cfg-foot{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.85rem;justify-content:center;position:relative;z-index:1}
+/* ============ chart ============ */
+.chartwrap{position:relative;z-index:1}
+.chart{display:block;width:100%;height:auto}
+.chart .gridline{stroke:rgba(148,163,184,.1);stroke-width:1}
+.chart .baseline{stroke:rgba(165,163,194,.25);stroke-width:1}
+.chart .col{cursor:pointer}
+.chart .col rect.b{transform-box:fill-box;transform-origin:bottom;animation:grow .65s var(--e-out) both;animation-delay:var(--gd,0s)}
+@keyframes grow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+.chart .col.today rect.b{filter:drop-shadow(0 0 6px rgba(255,193,77,.55))}
+.ctip{position:absolute;top:0;transform:translateX(-50%) translateY(-4px);background:#1e1548;border:1px solid var(--bd2);border-radius:10px;padding:.35rem .65rem;font-size:.72rem;font-weight:700;color:var(--tx);pointer-events:none;opacity:0;transition:opacity var(--d-fast);white-space:nowrap;box-shadow:var(--sh-2);z-index:2}
+.ctip.on{opacity:1}
+.ctip i{font-style:normal;color:var(--tx3);font-weight:600;margin-inline-start:.35rem}
+.xlab{display:flex;margin-top:.35rem}
+.xlab>div{flex:1;text-align:center;min-width:0}
+.xlab b{display:block;font-size:.6rem;font-weight:700;color:var(--tx2);font-variant-numeric:tabular-nums}
+.xlab i{display:block;font-size:.6rem;color:var(--tx3);font-style:normal}
+.xlab .td b,.xlab .td i{color:var(--wn);font-weight:800}
+/* ============ activity timeline ============ */
+.tl{position:relative;padding-inline-start:.2rem;z-index:1}
+.tl .ev{display:flex;gap:.75rem;align-items:flex-start;padding:.5rem 0;position:relative}
+.tl .ev:not(:last-child)::before{content:'';position:absolute;top:1.6rem;bottom:-.2rem;right:.42rem;width:1px;background:linear-gradient(180deg,rgba(165,163,194,.3),transparent)}
+.tl .dot{width:.62rem;height:.62rem;border-radius:50%;flex-shrink:0;margin-top:.42rem;box-shadow:0 0 8px currentColor}
+.tl .dot.on{background:var(--ok);color:var(--ok)}
+.tl .dot.off{background:var(--dg);color:var(--dg)}
+.tl .etxt{font-size:.8rem;font-weight:600;line-height:1.5}
+.tl .etxt em{font-style:normal;color:var(--tx2);font-weight:700;font-size:.72rem;background:rgba(148,163,184,.12);border-radius:99px;padding:0 .45rem;margin-inline-start:.3rem}
+.tl .tt{font-size:.7rem;color:var(--tx3);font-variant-numeric:tabular-nums;margin-inline-start:auto;flex-shrink:0;padding-top:.2rem}
+.tl .empty{color:var(--tx3);font-size:.8rem;padding:.4rem 0}
+/* ============ modal / toast / footer ============ */
+.modal{display:none;position:fixed;inset:0;background:rgba(4,6,14,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);z-index:var(--z-modal);justify-content:center;align-items:center;padding:1.1rem}
 .modal.active{display:flex}
-.mbox{background:var(--bg2);border:1px solid var(--bd2);border-radius:18px;padding:1.4rem;max-width:420px;width:100%;text-align:center;box-shadow:var(--sh),var(--glow);animation:up .28s ease both}
+.mbox{background:linear-gradient(170deg,#201650,#100b2c);border:1px solid var(--bd2);border-radius:20px;padding:1.4rem;max-width:420px;width:100%;text-align:center;box-shadow:var(--sh-2);animation:mIn .35s var(--e-spring) both;max-height:92vh;overflow:auto}
+@keyframes mIn{from{opacity:0;transform:scale(.9) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
 .mbox h3{font-size:.95rem;margin-bottom:.9rem;color:var(--tx)}
-.qrbox{background:#fff;border-radius:12px;padding:10px;display:inline-block;margin-bottom:.9rem}
-.qrbox svg{display:block;width:min(260px,70vw);height:auto}
-.mlink{background:linear-gradient(170deg,rgba(30,44,74,.7),rgba(10,14,26,.85));border:1px solid var(--bd);border-radius:8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06);padding:.55rem;font-family:ui-monospace,monospace;font-size:.66rem;word-break:break-all;color:#a5f3fc;direction:ltr;text-align:left;margin-bottom:.9rem;max-height:80px;overflow-y:auto}
-.logrow{display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px solid var(--bd);font-size:.78rem}
-.logrow:last-child{border-bottom:none}
-.logrow .t{color:var(--tx3);font-variant-numeric:tabular-nums}
-.dot{width:.55em;height:.55em;border-radius:50%;display:inline-block;margin-inline-end:.4em;vertical-align:middle}
-.toast{position:fixed;bottom:1.2rem;left:50%;transform:translateX(-50%) translateY(80px);background:var(--bg2);border:1px solid var(--ac);color:var(--ac);padding:.6rem 1.2rem;border-radius:999px;font-size:.85rem;font-weight:700;transition:transform .3s ease;z-index:200;box-shadow:var(--sh)}
-.toast.show{transform:translateX(-50%) translateY(0)}
-.foot{text-align:center;color:var(--tx3);font-size:.72rem;padding:1.2rem 0 .5rem;letter-spacing:.1px}
+.qrbox{background:#fff;border-radius:14px;padding:10px;display:inline-block;margin-bottom:.9rem;position:relative;min-width:180px;min-height:180px;overflow:hidden}
+.qrbox svg{display:block;width:min(250px,62vw);height:auto;margin:0 auto}
+.qrbox.skel::after{content:'';position:absolute;inset:0;background:linear-gradient(115deg,rgba(10,12,30,.06) 30%,rgba(10,12,30,.16) 50%,rgba(10,12,30,.06) 70%);background-size:220% 100%;animation:shim .9s linear infinite}
+@keyframes shim{from{background-position:120% 0}to{background-position:-120% 0}}
+.mlink{background:rgba(15,11,38,.82);border:1px solid var(--bd);border-radius:10px;padding:.6rem;font-family:ui-monospace,'SF Mono',Consolas,monospace;font-size:.68rem;word-break:break-all;color:#d6ecff;direction:ltr;text-align:left;margin-bottom:.9rem;max-height:84px;overflow-y:auto}
+.toast{position:fixed;bottom:calc(1.2rem + env(safe-area-inset-bottom));left:50%;z-index:var(--z-toast);background:#1a1140;border:1px solid rgba(179,146,255,.55);color:#d8ccff;padding:.65rem 1.35rem;border-radius:var(--rp);font-size:.85rem;font-weight:800;box-shadow:var(--sh-2),0 0 22px -8px rgba(56,208,248,.5);transform:translateX(-50%) translateY(170%);opacity:0;transition:transform .42s var(--e-spring),opacity .28s var(--e-out);pointer-events:none}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+.foot{text-align:center;color:var(--tx3);font-size:.72rem;padding:1.4rem 0 .4rem;letter-spacing:.1px}
+/* ============ v2 upgrade: gauge, hero metrics, richer boxes ============ */
+.card{background:linear-gradient(165deg,rgba(32,22,84,.94),rgba(11,8,32,.97) 70%);border-color:rgba(160,150,230,.2);box-shadow:0 18px 40px -18px rgba(0,0,0,.75),inset 0 1px 0 rgba(255,255,255,.08),inset 0 0 44px -22px rgba(56,208,248,.14)}
+.tile{background:linear-gradient(170deg,rgba(54,44,120,.5),rgba(12,9,34,.78))}
+.tile .tico{color:var(--ac)}
+.b-ok{box-shadow:0 0 22px -8px rgba(46,230,166,.6)}
+.b-no{box-shadow:0 0 22px -8px rgba(255,107,129,.55)}
+.logo .dr{stroke-dasharray:1 1;stroke-dashoffset:1;animation:drawIn 1.2s var(--e-out) .15s forwards}
+.logo .d2{animation-delay:.6s}
+@keyframes drawIn{to{stroke-dashoffset:0}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes hb{50%{transform:scale(1.4)}}
+@keyframes barIn{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes flow{to{background-position:40px 0}}
+.ringwrap{width:188px;height:188px}
+.ring{overflow:visible}
+.ring .bar{transform-origin:80px 80px}
+.ring .trk{stroke:rgba(150,143,205,.13)}
+.ring .v{stroke-width:10}.ring .t{stroke-width:7}
+.ring .bar.v.ok{stroke:url(#gv-ok);filter:drop-shadow(0 0 6px rgba(56,208,248,.55))}
+.ring .bar.t.ok{stroke:url(#gt-ok);filter:drop-shadow(0 0 5px rgba(46,230,166,.5))}
+.ring .bar.wn{stroke:url(#gr-wn);filter:drop-shadow(0 0 6px rgba(255,193,77,.55))}
+.ring .bar.dg{stroke:url(#gr-dg);filter:drop-shadow(0 0 6px rgba(255,107,129,.55))}
+.ring .ticks{fill:none;stroke:rgba(165,163,194,.3);stroke-width:4;stroke-dasharray:1.1 9.11;transform-origin:80px 80px;animation:spin 120s linear infinite}
+.ring .trk.inf{stroke:rgba(179,146,255,.45);stroke-dasharray:3 7;transform-origin:80px 80px;animation:spin 48s linear infinite}
+.ring .trk.t.inf{animation-direction:reverse;stroke:rgba(56,208,248,.35)}
+.ring .head{transform-origin:80px 80px;transition:transform 1.1s var(--e-out)}
+.ring .head circle{fill:#fff;filter:drop-shadow(0 0 4px rgba(255,255,255,.95));transform-box:fill-box;transform-origin:center;animation:hb 2.4s ease-in-out infinite}
+.ringc b{font-size:2.15rem}
+.usage .tiles{grid-template-columns:repeat(2,1fr)}
+.tile.hero{grid-column:1/-1;text-align:start;padding:.85rem 1rem .8rem;position:relative;overflow:hidden;--kc:linear-gradient(180deg,#38d0f8,#b392ff);--kg:rgba(56,208,248,.6)}
+.tile.hero::before{content:'';position:absolute;inset-block:0;inset-inline-start:0;width:3px;background:var(--kc);box-shadow:0 0 14px var(--kg)}
+.tile.hero.tim{--kc:linear-gradient(180deg,#2ee6a6,#2dd4d4);--kg:rgba(46,230,166,.55)}
+.tile.hero.wn{--kc:#ffc14d;--kg:rgba(255,193,77,.6)}
+.tile.hero.dg{--kc:#ff6b81;--kg:rgba(255,107,129,.6)}
+.hh{display:flex;align-items:center;gap:.5rem}
+.hh h4{margin:0;font-size:.76rem;color:var(--tx2);font-weight:700}
+.hh .hi{width:1.05rem;height:1.05rem;color:var(--ac)}
+.tile.hero.tim .hi{color:var(--ok)}
+.hh .hp{margin-inline-start:auto;font-size:.72rem;font-weight:800;color:var(--tx2);font-variant-numeric:tabular-nums}
+.hv{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap;margin-top:.15rem}
+.hv>span:first-child{font-size:1.6rem;font-weight:900;font-variant-numeric:tabular-nums;line-height:1.3}
+.tile.hero.wn .hv>span:first-child{color:var(--wn)}
+.tile.hero.dg .hv>span:first-child{color:var(--dg)}
+.hv .inf{background:linear-gradient(120deg,#38d0f8,#b392ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hv small{color:var(--tx3);font-size:.72rem;font-weight:600}
+.hs{font-size:.7rem;color:var(--tx3);margin-top:.35rem}
+.mbar{height:6px;border-radius:99px;background:rgba(148,163,184,.14);overflow:hidden;margin-top:.5rem}
+.mbar i{display:block;height:100%;width:var(--w);border-radius:inherit;background:linear-gradient(90deg,#38d0f8,#b392ff);transform-origin:right;animation:barIn 1.1s var(--e-out) .35s both}
+.tile.hero.tim .mbar i{background:linear-gradient(90deg,#2ee6a6,#2dd4d4)}
+.tile.hero.wn .mbar i{background:linear-gradient(90deg,#ffc14d,#f59e0b)}
+.tile.hero.dg .mbar i{background:linear-gradient(90deg,#ff6b81,#ef4444)}
+.mbar.flow i{width:100%;background:repeating-linear-gradient(115deg,rgba(179,146,255,.55) 0 10px,rgba(56,208,248,.4) 10px 20px);background-size:40px 100%;animation:barIn 1s var(--e-out) .3s both,flow 1.6s linear infinite}
+@media (prefers-reduced-motion:reduce){
+  .ring .ticks,.ring .trk.inf,.ring .head circle,.mbar i,.logo .dr{animation:none!important}
+  .logo .dr{stroke-dashoffset:0!important}
+  .mbar i{transform:none!important}
+  .ring .head{transition:none}
+}
+/* ============ reduced motion ============ */
+@media (prefers-reduced-motion:reduce){
+  .rv,.hero.rv,.node{animation:none!important;opacity:1!important;transform:none!important;filter:none!important}
+  .au i{animation:none!important}
+  .pulse::after{animation:none!important;opacity:0!important}
+  .chart .col rect.b{animation:none!important;transform:none!important}
+  .cfg-drawer,.cfg-h .chev{transition:none}
+  .ring .bar{transition:none}
+  .fill{transition:none}
+  .toast{transition:opacity .15s linear}
+  .btn,.tile,.app-btn{transition:none}
+  .card::after{display:none}
+  .card::before{animation:none!important;filter:none}
+}
 </style>
 </head>
 <body>
+<div class="au" aria-hidden="true"><i class="a1"></i><i class="a2"></i><i class="a3"></i><i class="a4"></i></div>
+<div class="dots" aria-hidden="true"></div>
 <div class="wrap">
-  <div class="hero">
-    <h1><svg viewBox="0 0 24 24" class="logo"><path d="M12 2 L20 5.5 V11 C20 16.5 16.6 20.6 12 22 C7.4 20.6 4 16.5 4 11 V5.5 Z" fill="none" stroke="url(#none)" stroke-width="2"/></svg><span>ShadowVPN</span></h1>
-    <div class="sub">پنل کاربری — ${esc(u.username || 'کاربر')}</div>
-    ${active ? '<span class="badge b-ok">● اشتراک فعال</span>' : frozen ? '<span class="badge b-wn">● موقتاً غیرفعال (فریز)</span>' : expired ? '<span class="badge b-no">● اشتراک منقضی شده</span>' : '<span class="badge b-no">● اشتراک غیرفعال</span>'}
-  </div>
 
-  <div class="card beam" style="animation-delay:.05s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v-4"/><path d="M12 15V7"/><path d="M17 15v-6"/></svg>وضعیت مصرف</h2>
-    <div class="grid">
-      <div class="cell"><h4>حجم مصرف شده</h4><div class="v">${fmt(usedBW)}${maxBW > 0 ? ' <small style="color:var(--tx3);font-size:.65em">/ ' + fmt(maxBW) + '</small>' : ''}</div></div>
-      <div class="cell"><h4>درصد مصرف</h4><div class="v ${bwClass}">${maxBW > 0 ? percent + '%' : 'نامحدود'}</div></div>
-      <div class="cell"><h4>تاریخ انقضا</h4><div class="v">${u.expires_at ? u.expires_at.split(' ')[0] : '∞'}</div></div>
-      <div class="cell"><h4>روز باقی‌مانده</h4><div class="v ${daysLeft !== null && daysLeft <= 3 ? 'dg' : ''}">${daysLeft !== null ? daysLeft + ' روز' : 'نامحدود'}</div></div>
-      <div class="cell"><h4>دستگاه آنلاین</h4><div class="v ${data.devices >= (u.max_connections || 0) && (u.max_connections || 0) > 0 ? 'dg' : 'ok'}">${data.devices}${(u.max_connections || 0) > 0 ? ' <small style="color:var(--tx3);font-size:.65em">/ ' + u.max_connections + '</small>' : ''}</div></div>
-      <div class="cell"><h4>کل درخواست‌ها</h4><div class="v">${(u.total_requests || 0).toLocaleString('fa-IR')}</div></div>
+  <header class="hero rv" style="--d:.02s">
+    <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38d0f8"/><stop offset="1" stop-color="#b392ff"/></linearGradient></defs>
+      <path class="dr" pathLength="1" d="M24 3.5 L41 10 v12.5 C41 33.5 33.8 41.6 24 45 C14.2 41.6 7 33.5 7 22.5 V10 Z" fill="rgba(56,208,248,.07)" stroke="url(#lg)" stroke-width="2.4" stroke-linejoin="round"/>
+      <path class="dr d2" pathLength="1" d="M17 36 v-10 a7 7 0 0 1 14 0 v10" fill="none" stroke="url(#lg)" stroke-width="2.4" stroke-linecap="round"/>
+      <circle cx="24" cy="24.5" r="2.6" fill="url(#lg)"/>
+      <path d="M24 27 v4.5" stroke="url(#lg)" stroke-width="2.4" stroke-linecap="round"/>
+    </svg>
+    <h1>${esc(u.username || 'کاربر')}</h1>
+    <div class="hsub">پنل اشتراک ShadowVPN</div>
+    ${badge}
+  </header>
+
+  <section class="card rv" style="--d:.08s" aria-labelledby="h-usage">
+    <h2 id="h-usage"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 21a9 9 0 1 0-9-9"/><path d="M3 12l2.5 2.5"/><path d="M12 12l4-3"/><circle cx="12" cy="12" r="1.6"/></svg>وضعیت مصرف</h2>
+    <div class="usage">
+      <div class="ringwrap">
+        <svg class="ring" viewBox="0 0 160 160" role="img" aria-label="${maxBW > 0 ? 'مصرف حجم ' + percent + ' درصد' : 'حجم نامحدود'}${timePct !== null ? '، زمان سپری‌شده ' + timePct + ' درصد' : ''}">
+          <defs>
+            <linearGradient id="gv-ok" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38d0f8"/><stop offset=".55" stop-color="#8b9cff"/><stop offset="1" stop-color="#d08bff"/></linearGradient>
+            <linearGradient id="gt-ok" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2ee6a6"/><stop offset="1" stop-color="#2dd4d4"/></linearGradient>
+            <linearGradient id="gr-wn" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffc14d"/><stop offset="1" stop-color="#f59e0b"/></linearGradient>
+            <linearGradient id="gr-dg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff6b81"/><stop offset="1" stop-color="#ef4444"/></linearGradient>
+          </defs>
+          <circle class="ticks" cx="80" cy="80" r="78"/>
+          ${maxBW > 0 ? `<circle class="trk v" cx="80" cy="80" r="68"/><circle class="bar v ${bwClass}" cx="80" cy="80" r="68" data-p="${percent}" data-head="hd-v"/><g class="head" id="hd-v"><circle cx="80" cy="12" r="3.6"/></g>` : `<circle class="trk v inf" cx="80" cy="80" r="68"/>`}
+          ${timePct !== null ? `<circle class="trk t" cx="80" cy="80" r="52"/><circle class="bar t ${timeClass}" cx="80" cy="80" r="52" data-p="${timePct}" data-head="hd-t"/><g class="head" id="hd-t"><circle cx="80" cy="28" r="3"/></g>` : `<circle class="trk t inf" cx="80" cy="80" r="52"/>`}
+        </svg>
+        <div class="ringc">${maxBW > 0 ? `<b><span data-count="${percent}">0</span><span class="pc">%</span></b><small>مصرف حجم</small>` : `<span class="biginf">∞</span><small>حجم نامحدود</small>`}</div>
+      </div>
+      <div class="tiles">
+        <div class="tile hero vol ${bwClass}">
+          <div class="hh"><svg class="hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12Z"/></svg><h4>حجم</h4><span class="hp">${maxBW > 0 ? percent + '٪ مصرف' : 'نامحدود'}</span></div>
+          ${maxBW > 0
+            ? `<div class="hv"><span data-count="${remBW}" data-fmt="bytes">0 B</span><small>باقی‌مانده از ${fmt(maxBW)}</small></div><div class="mbar"><i style="--w:${percent}%"></i></div><div class="hs">مصرف شده: ${fmt(usedBW)}</div>`
+            : `<div class="hv"><span class="inf">∞</span><small>بدون محدودیت حجم</small></div><div class="mbar flow"><i></i></div><div class="hs">مصرف شده: ${fmt(usedBW)}</div>`}
+        </div>
+        <div class="tile hero tim ${timeClass}">
+          <div class="hh"><svg class="hi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><h4>زمان</h4><span class="hp">${timePct !== null ? timePct + '٪ سپری شده' : 'نامحدود'}</span></div>
+          ${daysLeft !== null
+            ? `<div class="hv"><span data-count="${daysLeft}">0</span><small>روز باقی‌مانده${timeTotal ? ' از ' + timeTotal : ''}</small></div><div class="mbar"><i style="--w:${timePct ?? 0}%"></i></div><div class="hs">${daysLeft <= 7 ? 'زمان تمدید نزدیک است' : 'انقضا: ' + esc(u.expires_at.split(' ')[0])}</div>`
+            : `<div class="hv"><span class="inf">∞</span><small>بدون محدودیت زمان</small></div><div class="mbar flow"><i></i></div><div class="hs">این اشتراک تاریخ انقضا ندارد</div>`}
+        </div>
+        <div class="tile"><svg class="tico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="6" y="3" width="12" height="18" rx="2.5"/><path d="M11 18h2"/></svg><h4>دستگاه آنلاین</h4><div class="tv ${data.devices >= (u.max_connections || 0) && (u.max_connections || 0) > 0 ? 'dg' : 'ok'}"><span data-count="${data.devices}">0</span>${(u.max_connections || 0) > 0 ? ' <small>/ ' + u.max_connections + '</small>' : ''}</div></div>
+        <div class="tile"><svg class="tico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3.5" y="5" width="17" height="16" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg><h4>تاریخ انقضا</h4><div class="tv">${u.expires_at ? esc(u.expires_at.split(' ')[0]) : '<span class="inf">∞</span>'}</div></div>
+        <div class="tile"><svg class="tico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 17l5-5-5-5M12 19h8"/></svg><h4>کل درخواست‌ها</h4><div class="tv"><span data-count="${u.total_requests || 0}">0</span></div></div>
+        <div class="tile"><svg class="tico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg><h4>وضعیت اشتراک</h4><div class="tv ${active ? 'ok' : expired ? 'dg' : 'wn'}">${active ? 'فعال' : frozen ? 'فریز' : expired ? 'منقضی' : 'غیرفعال'}</div></div>
+      </div>
     </div>
-    ${maxBW > 0 ? '<div class="progress"><div class="pbar ' + bwClass + '" style="width:' + percent + '%"></div></div><div class="plabel">' + percent + '% از حجم اشتراک مصرف شده</div>' : ''}
-  </div>
+  </section>
 
-  <div class="card beam" style="animation-delay:.1s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>اشتراک</h2>
-    <div class="subbox beam" id="subLink" onclick="copySub()" title="بزن تا کپی شود">${esc(data.subUrl)}</div>
-    <div style="display:flex;flex-wrap:wrap;margin-top:.7rem;justify-content:center">
-      <button class="btn btn-p" onclick="copySub()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>کپی لینک اشتراک</button>
-      <button class="btn" onclick="showQR('sub', 'لینک اشتراک')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3h-3"/><path d="M14 21h3"/><path d="M21 21h.01"/></svg>QR اشتراک</button>
+  <section class="card rv" style="--d:.14s" aria-labelledby="h-sub">
+    <h2 id="h-sub"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.1"/></svg>لینک اشتراک</h2>
+    <div class="subrow" id="subLink" role="button" tabindex="0" aria-label="کپی لینک اشتراک" onclick="copySub()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();copySub()}">
+      <span class="subtxt" id="subTxt">${esc(data.subUrl)}</span>
     </div>
-  </div>
-
-  <div class="card beam" style="animation-delay:.12s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12Z"/></svg>افزودن خودکار به اپلیکیشن</h2>
-    <div style="font-size:.75rem;color:var(--tx2);margin-bottom:.8rem;text-align:center;line-height:1.7">اپ موردنظر را روی گوشی نصب دارید؟ روی دکمه‌اش بزنید — اپ باز می‌شود و اشتراک <b>خودکار</b> اضافه می‌شود.</div>
-    <div class="apps appsframe">
-      <a class="app-btn" href="${esc(appLinks.happ)}"><span style="font-size:1.05rem;font-weight:800">Happ</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS · ویندوز</span></a>
-      <a class="app-btn" href="${esc(appLinks.v2raytun)}"><span style="font-size:1.05rem;font-weight:800">v2rayNG / Tun</span><span style="font-size:.68rem;opacity:.7">اندروید</span></a>
-      <a class="app-btn" href="${esc(appLinks.hiddify)}"><span style="font-size:1.05rem;font-weight:800">Hiddify</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS · دسکتاپ</span></a>
-      <a class="app-btn" href="${esc(appLinks.streisand)}"><span style="font-size:1.05rem;font-weight:800">Streisand</span><span style="font-size:.68rem;opacity:.7">iOS</span></a>
-      <a class="app-btn" href="${esc(appLinks.v2box)}"><span style="font-size:1.05rem;font-weight:800">V2Box</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS</span></a>
-      <a class="app-btn" href="${esc(appLinks.npv)}"><span style="font-size:1.05rem;font-weight:800">NekoBox / NPV</span><span style="font-size:.68rem;opacity:.7">اندروید</span></a>
-      <button class="app-btn" onclick="showQR('sub', 'اسکن با اپ')"><span style="font-size:1.05rem;font-weight:800">سایر اپ‌ها</span><span style="font-size:.68rem;opacity:.7">اسکن QR داخل اپ</span></button>
+    <div class="btnrow">
+      <button class="btn btn-p" id="subBtn" onclick="copySub()">
+        <svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg>
+        <svg class="ic-tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>
+        <span>کپی لینک اشتراک</span>
+      </button>
+      <button class="btn" onclick="showQR('sub','لینک اشتراک')" aria-label="نمایش QR لینک اشتراک">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM21 14v3h-3M14 21h3M21 21h.01"/></svg>
+        <span>QR</span>
+      </button>
     </div>
-    <div style="font-size:.72rem;color:var(--tx3);margin-top:.7rem;text-align:center">اگر اپ باز نشد، دکمه QR را بزنید و کد را با اسکنر داخل اپ بخوانید.</div>
-  </div>
+  </section>
 
-  <div class="card beam" style="animation-delay:.15s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2Z"/><path d="M3 8.2 12 13.4l9-5.2"/><path d="M12 13.4V21"/></svg>کانفیگ‌ها (${nodes.length})</h2>
-    <div id="nodes">
-${nodes.map((n, i) => '      <div class="node"><div class="row"><span class="nm">' + esc(n.name) + '</span><span class="acts"><button class="btn btn-o btn-xs" onclick="copyNode(' + i + ')">کپی</button><button class="btn btn-o btn-xs" onclick="showQR(' + "'" + 'n' + i + "'" + ', ' + "'" + esc(n.name).replace(/'/g, "\\'") + "'" + ')">QR</button></span></div><div class="lk">' + esc(n.link) + '</div></div>').join('\n')}
+  <section class="card rv" style="--d:.2s" aria-labelledby="h-apps">
+    <h2 id="h-apps"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></svg>افزودن خودکار به اپلیکیشن</h2>
+    <p class="app-lead">اپ موردنظر را روی گوشی نصب دارید؟ روی دکمه‌اش بزنید — اپ باز می‌شود و اشتراک <b>خودکار</b> اضافه می‌شود.</p>
+    <div class="apps">
+      <a class="app-btn" href="${esc(appLinks.happ)}"><span class="mono">H</span><span class="meta"><span class="an">Happ</span><span class="ap">اندروید · iOS · ویندوز</span></span></a>
+      <a class="app-btn" href="${esc(appLinks.v2raytun)}"><span class="mono">v2</span><span class="meta"><span class="an">v2rayNG / Tun</span><span class="ap">اندروید</span></span></a>
+      <a class="app-btn" href="${esc(appLinks.hiddify)}"><span class="mono">Hi</span><span class="meta"><span class="an">Hiddify</span><span class="ap">اندروید · iOS · دسکتاپ</span></span></a>
+      <a class="app-btn" href="${esc(appLinks.streisand)}"><span class="mono">St</span><span class="meta"><span class="an">Streisand</span><span class="ap">iOS</span></span></a>
+      <a class="app-btn" href="${esc(appLinks.v2box)}"><span class="mono">V2</span><span class="meta"><span class="an">V2Box</span><span class="ap">اندروید · iOS</span></span></a>
+      <a class="app-btn" href="${esc(appLinks.npv)}"><span class="mono">N</span><span class="meta"><span class="an">NekoBox / NPV</span><span class="ap">اندروید</span></span></a>
+      <button class="app-btn" onclick="showQR('sub','اسکن با اپ')"><span class="mono">⌁</span><span class="meta"><span class="an">سایر اپ‌ها</span><span class="ap">اسکن QR داخل اپ</span></span></button>
     </div>
-    <div style="display:flex;flex-wrap:wrap;margin-top:.7rem;justify-content:center">
-      <button class="btn btn-p" onclick="copyAllNodes()">کپی همه کانفیگ‌ها</button>
-      <a class="btn" id="dlBtn" download="configs.txt" onclick="downloadNodes()">دانلود فایل</a>
+    <div class="app-note">اگر اپ باز نشد، دکمه QR را بزنید و کد را با اسکنر داخل اپ بخوانید.</div>
+  </section>
+
+  <section class="card rv" style="--d:.26s" aria-labelledby="h-cfg">
+    <button class="cfg-h" type="button" id="cfgHead" aria-expanded="false" aria-controls="cfgDrawer" onclick="tgCfg(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();tgCfg(this)}">
+      <h2 id="h-cfg" style="margin-bottom:0"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="var(--bg)"/><circle cx="15" cy="12" r="2" fill="var(--bg)"/><circle cx="8" cy="18" r="2" fill="var(--bg)"/></svg>کانفیگ‌ها <span class="cnt">${nodes.length}</span>
+      <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></h2>
+    </button>
+    <div class="cfg-drawer" id="cfgDrawer"><div class="cfg-inner">
+      <div id="nodes" style="margin-top:.4rem">
+${nodes.map((n, i) => '        <div class="node" style="--nd:' + Math.min(i * 0.03, 0.45) + 's"><div class="row"><span class="nm">' + esc(n.name) + '</span><span class="tagchip ' + (n.name.indexOf('Anti-DPI') >= 0 ? 'dpi' : 'plain') + '">' + (n.name.indexOf('Anti-DPI') >= 0 ? 'Anti-DPI' : 'Plain') + '</span><span class="acts"><button class="btn btn-xs" onclick="copyNode(' + i + ')" aria-label="کپی ' + esc(n.name) + '">کپی</button><button class="btn btn-xs" onclick="showQR(' + "'" + 'n' + i + "'" + ', ' + "'" + esc(n.name).replace(/'/g, "\\'") + "'" + ')" aria-label="QR ' + esc(n.name) + '">QR</button></span></div><div class="lk" title="' + esc(n.link) + '">' + esc(n.link) + '</div></div>').join('\n')}
+      </div>
+      <div class="cfg-foot">
+        <button class="btn btn-p" onclick="copyAllNodes()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg>کپی همه کانفیگ‌ها</button>
+        <button class="btn" id="dlBtn" onclick="downloadNodes()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 4v11M7.5 11l4.5 4.5 4.5-4.5M5 20h14"/></svg>دانلود فایل</button>
+      </div>
+    </div></div>
+  </section>
+
+  <section class="card rv" style="--d:.32s" aria-labelledby="h-chart">
+    <h2 id="h-chart"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/></svg>مصرف هفت روز اخیر<span class="aside">امروز: ${fmt(todayRow ? todayRow.total_bytes : 0)}</span></h2>
+    <div class="chartwrap" id="chartWrap">
+      <div class="ctip" id="ctip"></div>
+      <svg class="chart" viewBox="0 0 ${CH_W} ${CH_H}" role="img" aria-label="نمودار مصرف ۷ روز اخیر" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <linearGradient id="gr-n" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8be9fd"/><stop offset=".55" stop-color="#38d0f8"/><stop offset="1" stop-color="rgba(179,146,255,.75)"/></linearGradient>
+          <linearGradient id="gr-t" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fde68a"/><stop offset=".6" stop-color="#ffc14d"/><stop offset="1" stop-color="rgba(255,193,77,.6)"/></linearGradient>
+        </defs>
+        <line class="baseline" x1="${COL_X0 - 4}" y1="${CH_BASE}" x2="${CH_W - COL_X0 + 4}" y2="${CH_BASE}"/>
+${cols.map(c => '        <g class="col' + (c.d.date === todayISO ? ' today' : '') + '" data-i="' + c.i + '" data-cx="' + c.cx + '" data-v="' + fmt(c.d.total_bytes || 0) + '" data-d="' + userPanelDayLabel(c.d.date, todayISO) + '"><title>' + userPanelDayLabel(c.d.date, todayISO) + ': ' + fmt(c.d.total_bytes || 0) + '</title><rect class="b" style="--gd:' + (0.15 + c.i * 0.07) + 's" x="' + c.x + '" y="' + c.y + '" width="' + COL_W + '" height="' + c.h + '" rx="5" fill="' + (c.d.date === todayISO ? 'url(#gr-t)' : 'url(#gr-n)') + '"/><rect x="' + (c.x - 4) + '" y="0" width="' + (COL_W + 8) + '" height="' + CH_H + '" fill="transparent"/></g>').join('\n')}
+      </svg>
+      <div class="xlab">
+${chartDays.map(d => '        <div' + (d.date === todayISO ? ' class="td"' : '') + '><b>' + fmt(d.total_bytes || 0) + '</b><i>' + userPanelDayLabel(d.date, todayISO) + '</i></div>').join('\n')}
+      </div>
     </div>
-  </div>
+  </section>
 
-  ${data.daily.length > 0 ? `<div class="card beam" style="animation-delay:.2s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v-4"/><path d="M12 15V7"/><path d="M17 15v-6"/></svg>مصرف هفت روز اخیر</h2>
-    <div class="chart">${data.daily.map(d => '<div class="bar" style="height:' + Math.max(3, Math.round(((d.total_bytes || 0) / maxDaily) * 100)) + '%"><span>' + fmt(d.total_bytes || 0) + '</span></div>').join('')}</div>
-    <div class="xlab">${data.daily.map(d => '<div>' + d.date.slice(5) + '</div>').join('')}</div>
-  </div>` : ''}
-
-  <div class="card beam" style="animation-delay:.25s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg>آخرین فعالیت</h2>
-    ${data.recentConns.length === 0 ? '<div style="color:var(--tx3);font-size:.8rem">فعالیتی ثبت نشده</div>' : data.recentConns.map(l => {
-        const okc = l.event_type === 'connect' ? 'var(--ok)' : 'var(--dg)';
-        return '<div class="logrow"><span><span class="dot" style="background:' + okc + '"></span>' + (l.event_type === 'connect' ? 'اتصال جدید' : 'قطع اتصال') + (l.protocol ? ' · ' + esc(l.protocol) : '') + '</span><span class="t">' + esc((l.created_at || '').slice(0, 16)) + '</span></div>';
-    }).join('')}
-  </div>
+  <section class="card rv" style="--d:.38s" aria-labelledby="h-act">
+    <h2 id="h-act"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>آخرین فعالیت</h2>
+    <div class="tl">
+${data.recentConns.length === 0 ? '      <div class="empty">فعالیتی ثبت نشده</div>' : data.recentConns.map(l => {
+        const on = l.event_type === 'connect';
+        return '      <div class="ev"><span class="dot ' + (on ? 'on' : 'off') + '"></span><span class="etxt">' + (on ? 'اتصال جدید' : 'قطع اتصال') + (l.protocol ? '<em>' + esc(l.protocol) + '</em>' : '') + '</span><span class="tt" data-ts="' + esc(l.created_at || '') + '">' + esc((l.created_at || '').slice(5, 16)) + '</span></div>';
+    }).join('\n')}
+    </div>
+  </section>
 
   <div class="foot">ShadowVPN — اشتراک شما محرمانه است؛ آن را با کسی به اشتراک نگذارید.</div>
 </div>
 
-<div class="modal" id="qrModal">
+<div class="modal" id="qrModal" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
   <div class="mbox">
     <h3 id="qrTitle">QR</h3>
     <div class="qrbox" id="qrBox"></div>
     <div class="mlink" id="qrLink">-</div>
-    <button class="btn btn-p" onclick="copyShown()">کپی محتوا</button>
-    <button class="btn" onclick="hideQR()">بستن</button>
+    <div class="btnrow" style="margin-top:0">
+      <button class="btn btn-p" onclick="copyShown()">کپی محتوا</button>
+      <button class="btn" id="qrClose" onclick="hideQR()">بستن</button>
+    </div>
   </div>
 </div>
-<div class="toast" id="toast">کپی شد ✓</div>
+<div class="toast" id="toast" role="status" aria-live="polite">کپی شد ✓</div>
 
 <script>
 var QR_LIB = ${data.qrLib};
@@ -4660,38 +5101,194 @@ eval(QR_LIB);
 var _nodes = ${JSON.stringify(nodes)};
 var _subUrl = ${JSON.stringify(data.subUrl)};
 var _shown = '';
+var RM = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function fmtB(b){
+  if(!b||b<=0) return '0 B';
+  var s=['B','KB','MB','GB','TB'],k=1024;
+  var i=Math.min(Math.floor(Math.log(b)/Math.log(k)),s.length-1);
+  return parseFloat((b/Math.pow(k,i)).toFixed(2))+' '+s[i];
+}
+function shortUrl(t){
+  if(!t||t.length<=52) return t;
+  return t.slice(0,34)+'…'+t.slice(-14);
+}
+/* display shortened link; copy always uses the full URL */
+try{ var _st=document.getElementById('subTxt'); if(_st) _st.textContent=shortUrl(_subUrl); }catch(e){}
+
+/* ---- count-up (single bounded rAF, stops when done) ---- */
+function runCounters(){
+  var els=document.querySelectorAll('[data-count]');
+  if(RM){ els.forEach(function(el){
+      var v=Number(el.getAttribute('data-count'))||0;
+      el.textContent = el.getAttribute('data-fmt')==='bytes' ? fmtB(v) : v.toLocaleString('en-US');
+    }); return; }
+  els.forEach(function(el, idx){
+    var target=Number(el.getAttribute('data-count'))||0;
+    var isBytes=el.getAttribute('data-fmt')==='bytes';
+    var dur=650, delay=idx*60, t0=0;
+    function step(ts){
+      if(!t0) t0=ts;
+      var p=Math.min(1,(ts-t0)/dur);
+      var e=1-Math.pow(1-p,3);
+      var v=target*e;
+      el.textContent = isBytes ? fmtB(Math.round(v)) : Math.round(v).toLocaleString('en-US');
+      if(p<1) requestAnimationFrame(step);
+      else el.textContent = isBytes ? fmtB(target) : target.toLocaleString('en-US');
+    }
+    setTimeout(function(){ requestAnimationFrame(step); }, delay);
+  });
+}
+
+/* ---- ring draw ---- */
+function drawRing(){
+  document.querySelectorAll('.ring .bar').forEach(function(c){
+    var C=2*Math.PI*Number(c.getAttribute('r'));
+    var p=Number(c.getAttribute('data-p'))||0;
+    var h=document.getElementById(c.getAttribute('data-head'));
+    function go(){ c.style.strokeDashoffset=C-C*p/100; if(h) h.style.transform='rotate('+(p*3.6)+'deg)'; }
+    c.style.strokeDasharray=C;
+    if(RM){ go(); return; }
+    c.style.strokeDashoffset=C;
+    requestAnimationFrame(function(){ requestAnimationFrame(go); });
+  });
+}
+
+/* ---- chart tooltip ---- */
+(function(){
+  var wrap=document.getElementById('chartWrap');
+  if(!wrap) return;
+  var tip=document.getElementById('ctip');
+  var svg=wrap.querySelector('svg');
+  function show(g){
+    tip.innerHTML=g.getAttribute('data-d')+' <i>'+g.getAttribute('data-v')+'</i>';
+    var cx=Number(g.getAttribute('data-cx'))/350;
+    tip.style.left=(cx*100)+'%';
+    tip.style.top='0';
+    tip.classList.add('on');
+  }
+  function hide(){ tip.classList.remove('on'); }
+  wrap.querySelectorAll('.col').forEach(function(g){
+    g.addEventListener('pointerenter',function(){ show(g); });
+    g.addEventListener('pointerleave',hide);
+    g.addEventListener('click',function(){ show(g); });
+  });
+  svg.addEventListener('pointerleave',hide);
+})();
+
+/* ---- relative time on activity ---- */
+(function(){
+  document.querySelectorAll('.tt[data-ts]').forEach(function(el){
+    var raw=el.getAttribute('data-ts');
+    if(!raw) return;
+    el.setAttribute('title', raw);
+    var iso=raw.indexOf('T')>=0?raw:raw.replace(' ','T');
+    if(iso.slice(-1)!=='Z') iso+='Z';
+    var t=Date.parse(iso);
+    if(isNaN(t)) return;
+    var s=Math.max(0,Math.floor((Date.now()-t)/1000));
+    var txt = s<60 ? 'لحظاتی پیش' : s<3600 ? Math.floor(s/60)+' دقیقه پیش' : s<86400 ? Math.floor(s/3600)+' ساعت پیش' : Math.floor(s/86400)+' روز پیش';
+    el.textContent=txt;
+  });
+})();
+
+/* ---- card spotlight (hover devices only) ---- */
+(function(){
+  if(RM) return;
+  if(!(window.matchMedia && window.matchMedia('(hover: hover)').matches)) return;
+  var cards=document.querySelectorAll('.card');
+  cards.forEach(function(card){
+    card.addEventListener('pointermove',function(ev){
+      var r=card.getBoundingClientRect();
+      card.style.setProperty('--px',((ev.clientX-r.left)/r.width*100)+'%');
+      card.style.setProperty('--py',((ev.clientY-r.top)/r.height*100)+'%');
+    },{passive:true});
+  });
+})();
+
+/* ---- ripple on primary buttons ---- */
+document.addEventListener('pointerdown',function(ev){
+  if(RM) return;
+  var b=ev.target.closest?ev.target.closest('.btn-p'):null;
+  if(!b) return;
+  var r=b.getBoundingClientRect();
+  var d=Math.max(r.width,r.height);
+  var sp=document.createElement('span');
+  sp.className='ripple';
+  sp.style.width=sp.style.height=d+'px';
+  sp.style.left=(ev.clientX-r.left-d/2)+'px';
+  sp.style.top=(ev.clientY-r.top-d/2)+'px';
+  b.appendChild(sp);
+  setTimeout(function(){ sp.remove(); },520);
+},{passive:true});
+
+/* ---- QR ---- */
 function makeQR(text){
   try{
-    var qr = qrcode(0, 'M');
+    var qr=qrcode(0,'M');
     qr.addData(text); qr.make();
     return qr.createSvgTag({cellSize:4, margin:1});
   }catch(e){ return '<div style="color:#111;font-size:12px">متن برای QR طولانی است</div>'; }
 }
-function showQR(key, title){
-  var text = key === 'sub' ? _subUrl : (_nodes[Number(key.slice(1))] || {}).link || '';
-  _shown = text;
-  document.getElementById('qrTitle').textContent = title || 'QR';
-  document.getElementById('qrBox').innerHTML = makeQR(text);
-  document.getElementById('qrLink').textContent = text;
+function showQR(key,title){
+  var text = key==='sub' ? _subUrl : (_nodes[Number(key.slice(1))]||{}).link || '';
+  _shown=text;
+  document.getElementById('qrTitle').textContent=title||'QR';
+  var box=document.getElementById('qrBox');
+  box.className='qrbox skel';
+  box.innerHTML='';
+  document.getElementById('qrLink').textContent=text;
   document.getElementById('qrModal').classList.add('active');
+  var close=document.getElementById('qrClose'); if(close) close.focus();
+  setTimeout(function(){
+    box.className='qrbox';
+    box.innerHTML=makeQR(text);
+  }, RM?0:170);
 }
 function hideQR(){ document.getElementById('qrModal').classList.remove('active'); }
-document.getElementById('qrModal').addEventListener('click', function(e){ if(e.target === this) hideQR(); });
-function copyText(t, msg){
-  var done = function(){ toast(msg || 'کپی شد ✓'); };
-  if(navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(t).then(done).catch(function(){ fb(t, done); }); }
-  else fb(t, done);
-  function fb(txt, cb){ var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); cb(); }
+(function(){
+  var m=document.getElementById('qrModal');
+  m.addEventListener('click',function(e){ if(e.target===this) hideQR(); });
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&m.classList.contains('active')) hideQR(); });
+})();
+
+/* ---- copy / toast ---- */
+function copyText(t,msg){
+  var done=function(){ toast(msg||'کپی شد ✓'); };
+  if(navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(t).then(done).catch(function(){ fb(t,done); }); }
+  else fb(t,done);
+  function fb(txt,cb){ var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); cb(); }
 }
-function copySub(){ copyText(_subUrl); }
+function toast(m){
+  var t=document.getElementById('toast');
+  t.textContent=m; t.classList.add('show');
+  clearTimeout(t._h);
+  t._h=setTimeout(function(){ t.classList.remove('show'); },1700);
+}
+function tickCopy(btn){
+  if(!btn) return;
+  btn.classList.add('copied');
+  clearTimeout(btn._h);
+  btn._h=setTimeout(function(){ btn.classList.remove('copied'); },1300);
+}
+function copySub(){ copyText(_subUrl); tickCopy(document.getElementById('subBtn')); }
 function copyNode(i){ copyText(_nodes[i].link); }
 function copyAllNodes(){ copyText(_nodes.map(function(n){return n.link;}).join('\\n')); }
 function downloadNodes(){
-  var blob = new Blob([_nodes.map(function(n){return n.link;}).join('\\n')], {type:'text/plain'});
-  var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'configs.txt'; a.click();
+  var blob=new Blob([_nodes.map(function(n){return n.link;}).join('\\n')],{type:'text/plain'});
+  var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='configs.txt'; a.click();
 }
 function copyShown(){ copyText(_shown); }
-function toast(m){ var t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(function(){t.classList.remove('show');}, 1600); }
+
+/* ---- configs accordion ---- */
+function tgCfg(h){
+  var d=document.getElementById('cfgDrawer');
+  var open=d.classList.toggle('open');
+  h.setAttribute('aria-expanded',open?'true':'false');
+}
+
+runCounters();
+drawRing();
 </script>
 </body>
 </html>`;
@@ -4868,18 +5465,30 @@ async function sendExpiryWarnings(env) {
 async function cleanOldLogs(env) {
     if (!env.DB) return;
 
-    try {
-        const result = await env.DB.prepare(`
-            DELETE FROM connection_logs
-            WHERE created_at < datetime('now', '-30 days')
-        `).run();
-
-        if (result.meta?.changes > 0) {
-            console.log(`[Cron] Cleaned ${result.meta.changes} old log entries`);
+    // Every purge is bounded (LIMIT inside the sub-select, a few passes at most) so a big
+    // backlog is drained over several nights instead of one huge write burst.
+    const purge = async (label, sql, batch) => {
+        try {
+            for (let pass = 0; pass < 6; pass++) {
+                const r = await env.DB.prepare(sql).bind(batch).run();
+                const n = (r.meta && r.meta.changes) || r.changes || 0;
+                if (n > 0) console.log(`[Cron] ${label}: removed ${n}`);
+                if (n < batch) break;
+            }
+        } catch (e) {
+            console.error(`[Cron] ${label} cleanup error:`, e);
         }
-    } catch (e) {
-        console.error('[Cron] Clean logs error:', e);
-    }
+    };
+    // connection_logs: 30 days AND a hard cap of the newest 50k rows
+    await purge('connection_logs (age)',
+        "DELETE FROM connection_logs WHERE id IN (SELECT id FROM connection_logs WHERE created_at < datetime('now', '-30 days') LIMIT ?)", 5000);
+    await purge('connection_logs (row cap)',
+        "DELETE FROM connection_logs WHERE id IN (SELECT id FROM connection_logs WHERE id <= (SELECT MAX(id) FROM connection_logs) - 50000 LIMIT ?)", 5000);
+    // notification_queue: delivered rows after 3 days; undelivered (e.g. no bot token set) after 30
+    await purge('notification_queue (sent)',
+        "DELETE FROM notification_queue WHERE id IN (SELECT id FROM notification_queue WHERE sent = 1 AND created_at < datetime('now', '-3 days') LIMIT ?)", 2000);
+    await purge('notification_queue (stale)',
+        "DELETE FROM notification_queue WHERE id IN (SELECT id FROM notification_queue WHERE created_at < datetime('now', '-30 days') LIMIT ?)", 2000);
 }
 
 async function processNotifications(env) {
@@ -4936,7 +5545,7 @@ async function processNotifications(env) {
 async function runMigrations(env) {
     if (!env.DB) return;
 
-    const MIGRATION_VERSION = 8;
+    const MIGRATION_VERSION = 9;
     const currentVersion = await getMigrationVersion(env);
 
     if (currentVersion >= MIGRATION_VERSION) return;
@@ -4964,6 +5573,9 @@ async function runMigrations(env) {
         }
         if (currentVersion < 8) {
             await migrateToV8(env);
+        }
+        if (currentVersion < 9) {
+            await migrateToV9(env);
         }
 
         await setMigrationVersion(env, MIGRATION_VERSION);
@@ -5585,6 +6197,33 @@ async function migrateToV8(env) {
 }
 
 
+async function migrateToV9(env) {
+    console.log('[Migration] Running v9 migration...');
+
+    // active_connections had NO index besides the connection_id key, so every live-device
+    // query (admission check, COUNT(DISTINCT subnet), admin list sub-selects) scanned the whole
+    // table and D1 billed every scanned row as a read.
+    // NOTE: last_activity is deliberately NOT part of the index. D1 bills one extra row write
+    // per index entry touched, and last_activity is the column every heartbeat updates — an
+    // index containing it would double the heartbeat write cost. (user_id, subnet) only
+    // changes on insert/delete, which are rare.
+    // connection_logs: the user panel reads the latest rows of ONE user (ORDER BY id DESC);
+    // inserts there are deduplicated to ~1 per device per 30 min, so the extra write is cheap.
+    const stmts = [
+        'CREATE INDEX IF NOT EXISTS idx_ac_user ON active_connections(user_id, subnet)',
+        'CREATE INDEX IF NOT EXISTS idx_logs_user ON connection_logs(user_id, id)'
+    ];
+    for (const s of stmts) {
+        try {
+            await env.DB.exec(s);
+        } catch (e) {
+            console.error(`[Migration] v9 index error: ${e.message}`);
+        }
+    }
+    console.log('[Migration] v9 migration completed');
+}
+
+
 export default {
 	async fetch(request, env, ctx) {
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
@@ -6175,21 +6814,24 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}, env = 
 	let xhttpBytesUp = 0;
 	let xhttpBytesDown = 0;
 	let xhttpMatchedUUID = null;
+	let xhttpSubnet = null;
 	const XHTTP_BW_CHECK_INTERVAL = 25 * 1024 * 1024; // per-request sampling rate; D1 write cadence is buffer-controlled (100MB/5min, see flushBandwidth)
 	const trackXHTTPBandwidthUp = (chunkSize) => {
 		xhttpBytesUp += (chunkSize || 0);
+		if (xhttpSubnet) mgmtDeviceBeat(env, xhttpMatchedUUID, xhttpSubnet);
 		if (xhttpBytesUp + xhttpBytesDown >= XHTTP_BW_CHECK_INTERVAL) {
 			const up = xhttpBytesUp; const down = xhttpBytesDown;
 			xhttpBytesUp = 0; xhttpBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down));
+			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down, { subnet: xhttpSubnet }));
 		}
 	};
 	const trackXHTTPBandwidthDown = (chunkSize) => {
 		xhttpBytesDown += (chunkSize || 0);
+		if (xhttpSubnet) mgmtDeviceBeat(env, xhttpMatchedUUID, xhttpSubnet);
 		if (xhttpBytesUp + xhttpBytesDown >= XHTTP_BW_CHECK_INTERVAL) {
 			const up = xhttpBytesUp; const down = xhttpBytesDown;
 			xhttpBytesUp = 0; xhttpBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down));
+			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down, { subnet: xhttpSubnet }));
 		}
 	};
 
@@ -6203,6 +6845,13 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}, env = 
 	// Extract matched UUID for bandwidth tracking
 	if (首包.matchedUUID) xhttpMatchedUUID = 首包.matchedUUID;
 	if (xhttpMatchedUUID && env && env.DB) {
+		// Same admission as WebSocket: expiry / frozen / quota / max devices.
+		const adm = await mgmtAdmitStateless(env, xhttpMatchedUUID, request, 'vless');
+		if (!adm.ok) {
+			try { reader.releaseLock() } catch (e) { }
+			return new Response('Connection limit reached', { status: 403 });
+		}
+		xhttpSubnet = adm.subnet;
 		await mgmtIncrementRequestCount(env, xhttpMatchedUUID);
 	}
 	if (isSpeedTestSite(首包.hostname) && 反代上下文.代理类型 === null) {
@@ -6298,7 +6947,7 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}, env = 
 		if (env && env.DB && ctx && xhttpMatchedUUID && (xhttpBytesUp > 0 || xhttpBytesDown > 0)) {
 			const up = xhttpBytesUp; const down = xhttpBytesDown;
 			xhttpBytesUp = 0; xhttpBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down, { closing: true }));
+			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down, { closing: true, subnet: xhttpSubnet }));
 		}
 	});
 
@@ -6639,21 +7288,24 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 	let grpcBytesUp = 0;
 	let grpcBytesDown = 0;
 	let grpcMatchedUUID = null;
+	let grpcSubnet = null;
 	const GRPC_BW_CHECK_INTERVAL = 25 * 1024 * 1024; // per-request sampling rate; D1 write cadence is buffer-controlled (100MB/5min, see flushBandwidth)
 	const trackGRPCBandwidthUp = (chunkSize) => {
 		grpcBytesUp += (chunkSize || 0);
+		if (grpcSubnet) mgmtDeviceBeat(env, grpcMatchedUUID, grpcSubnet);
 		if (grpcBytesUp + grpcBytesDown >= GRPC_BW_CHECK_INTERVAL) {
 			const up = grpcBytesUp; const down = grpcBytesDown;
 			grpcBytesUp = 0; grpcBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down));
+			ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down, { subnet: grpcSubnet }));
 		}
 	};
 	const trackGRPCBandwidthDown = (chunkSize) => {
 		grpcBytesDown += (chunkSize || 0);
+		if (grpcSubnet) mgmtDeviceBeat(env, grpcMatchedUUID, grpcSubnet);
 		if (grpcBytesUp + grpcBytesDown >= GRPC_BW_CHECK_INTERVAL) {
 			const up = grpcBytesUp; const down = grpcBytesDown;
 			grpcBytesUp = 0; grpcBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down));
+			ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down, { subnet: grpcSubnet }));
 		}
 	};
 
@@ -6852,6 +7504,9 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 									}
 								}
 								if (grpcMatchedUUID && env && env.DB) {
+									const adm = await mgmtAdmitStateless(env, grpcMatchedUUID, request, 'trojan');
+									if (!adm.ok) throw new Error('Connection limit reached');
+									grpcSubnet = adm.subnet;
 									await mgmtIncrementRequestCount(env, grpcMatchedUUID);
 								}
 								log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
@@ -6875,6 +7530,9 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 								const { port, hostname, version, isUDP, rawClientData, matchedUUID: parsedUUID } = 解析结果;
 								if (parsedUUID) grpcMatchedUUID = parsedUUID;
 								if (grpcMatchedUUID && env && env.DB) {
+									const adm = await mgmtAdmitStateless(env, grpcMatchedUUID, request, 'vless');
+									if (!adm.ok) throw new Error('Connection limit reached');
+									grpcSubnet = adm.subnet;
 									await mgmtIncrementRequestCount(env, grpcMatchedUUID);
 								}
 								log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
@@ -6916,7 +7574,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 					if (env && env.DB && ctx && grpcMatchedUUID && (grpcBytesUp > 0 || grpcBytesDown > 0)) {
 						const up = grpcBytesUp; const down = grpcBytesDown;
 						grpcBytesUp = 0; grpcBytesDown = 0;
-						ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down, { closing: true }));
+						ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down, { closing: true, subnet: grpcSubnet }));
 					}
 					关闭连接();
 				}
@@ -7571,6 +8229,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	serverSock.addEventListener('message', (event) => {
 		const chunkBytes = event.data?.byteLength || event.data?.length || 0;
 		trackWSBandwidthUp(chunkBytes);
+		if (connectionTracked && matchedUUID && clientSubnet) mgmtDeviceBeat(env, matchedUUID, clientSubnet);
 		入队WS显式传输(event.data);
 	});
 	serverSock.addEventListener('close', () => {
@@ -7585,6 +8244,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		// the row alive for 10s after last activity so another socket from the same
 		// device (browsers open many) doesn't flip-flop the device row.
 		if (env && env.DB && ctx && matchedUUID && connectionTracked) {
+			connectionTracked = false; // release exactly once (error + close both fire)
 			const closeProto = 判断协议类型 === '木马' ? 'trojan' : 'vless';
 			const subnet = clientSubnet || getSubnetGroup(request.headers.get('CF-Connecting-IP') || 'unknown');
 			ctx.waitUntil((async () => {
@@ -7598,6 +8258,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	serverSock.addEventListener('error', (err) => {
 		// Same device-row cleanup on error (prevents zombie device rows)
 		if (env && env.DB && ctx && matchedUUID && connectionTracked) {
+			connectionTracked = false; // release exactly once (error + close both fire)
 			const errorProto = 判断协议类型 === '木马' ? 'trojan' : 'vless';
 			const subnet = clientSubnet || getSubnetGroup(request.headers.get('CF-Connecting-IP') || 'unknown');
 			ctx.waitUntil(mgmtRemoveActiveConnection(env, matchedUUID, subnet, errorProto));
