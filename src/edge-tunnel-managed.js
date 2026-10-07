@@ -57,6 +57,41 @@ function sgLinkHost(h) {
     return (typeof h === 'string' && h.includes(':')) ? `[${h}]` : h;
 }
 
+// --- Link variant families (A/B/C) for Iranian ISP filtering profiles ---
+// A = plain (unchanged legacy link)          B = Irancell F&F (byte-identical ANTI_DPI_PARAMS)
+// C = MCI/TCI: fp=chrome + alpn only (the Xray-only cs/fm trio stays B-only), except C3 adds fm.
+const SG_MCI_COMMON = '&fp=chrome&alpn=http%2F1.1';
+const SG_ECH_DEFAULT = 'cloudflare-ech.com+udp://1.1.1.1';
+// Tunables in the settings table (no redeploy): sg_variant_plain / sg_variant_irancell /
+// sg_variant_mci (default ON when unset) + sg_ech_config (default above).
+async function sgVariantFlags(env) {
+    const on = v => !(v === '0' || v === 'off' || v === 'false');
+    const [p, i, m, e] = await Promise.all([
+        getSetting(env, 'sg_variant_plain'), getSetting(env, 'sg_variant_irancell'),
+        getSetting(env, 'sg_variant_mci'), getSetting(env, 'sg_ech_config')
+    ]);
+    return { plain: on(p), irancell: on(i), mci: on(m), ech: (e && String(e).trim()) || SG_ECH_DEFAULT };
+}
+// Ordered variants for ONE endpoint. params -> appended before '#frag'; frag -> appended to the
+// legacy fragment (A='' and B=' · Anti-DPI' keep today's links BYTE-IDENTICAL); label -> display name.
+// opts.isIPv6: RAW host (pre-bracket) contains ':' -> emit C2/C3 (IPv6, no ECH) instead of C1.
+function sgBuildLinkVariants(opts) {
+    const f = (opts && opts.flags) || {};
+    const out = [];
+    if (f.plain !== false) out.push({ params: '', frag: '', label: 'ساده' });
+    if (f.irancell !== false) out.push({ params: ANTI_DPI_PARAMS, frag: ' · Anti-DPI', label: 'ایرانسل F&F' });
+    if (f.mci !== false) {
+        if (opts && opts.isIPv6) {
+            out.push({ params: SG_MCI_COMMON, frag: ' · همراه‌اول IPv6', label: 'همراه‌اول IPv6' });
+            out.push({ params: SG_MCI_COMMON + '&fm=' + encodeURIComponent(SG_FINAL_MASK), frag: ' · همراه‌اول IPv6 F&F', label: 'همراه‌اول IPv6 F&F' });
+        } else {
+            const ech = (f.ech && String(f.ech).trim()) || SG_ECH_DEFAULT;
+            out.push({ params: SG_MCI_COMMON + '&ech=' + encodeURIComponent(ech), frag: ' · همراه‌اول ECH', label: 'همراه‌اول ECH' });
+        }
+    }
+    return out;
+}
+
 // ============================================
 // INITIALIZATION
 // ============================================
@@ -213,15 +248,34 @@ function expandIPv6(ip) {
 	if (groups.length !== 8) return null;
 	return groups;
 }
+// Device identity = one (user, subnet) pair: IPv4 /N (N from settings `sg_ipv4_prefix`,
+// default 24 — unchanged behavior when unset) or IPv6 /64.
+// NOTE: one phone online through BOTH its v4 and v6 link variants therefore counts as TWO
+// devices toward max_connections for DEVICE_ADMIT_WINDOW_MIN — by design of this keying.
+let SG_IPV4_PREFIX = 24;
+async function sgLoadV4Prefix(env) {
+	try {
+		const v = await getSetting(env, 'sg_ipv4_prefix');
+		const n = v ? parseInt(v, 10) : 0;
+		SG_IPV4_PREFIX = (n >= 8 && n <= 32) ? n : 24;
+	} catch (e) { SG_IPV4_PREFIX = 24; }
+}
 function getSubnetGroup(ip) {
 	if (!ip || ip === 'unknown') return 'unknown';
 	const v6 = expandIPv6(ip);
 	if (v6) {
 		return v6.slice(0, 4).join(':') + '::/64';
 	}
-	// IPv4: /24 = first 3 octets
+	// IPv4: first octets per configurable prefix (default /24 = first 3 octets)
 	const parts = String(ip).split('.');
-	if (parts.length === 4) return parts.slice(0, 3).join('.') + '.0/24';
+	if (parts.length === 4) {
+		const bits = SG_IPV4_PREFIX;
+		const full = Math.floor(bits / 8), rem = bits % 8;
+		const octs = parts.slice(0, Math.min(full, 4));
+		if (rem > 0 && full < 4) octs.push(String((parseInt(parts[full], 10) & ((0xff << (8 - rem)) & 0xff)) & 0xff));
+		while (octs.length < 4) octs.push('0');
+		return octs.join('.') + '/' + bits;
+	}
 	return ip;
 }
 // ============================================
@@ -1330,15 +1384,19 @@ async function mgmtGetUserConfigs(uuid, env, request) {
             allIPs.push({ name: c.name, ip: c.ip || hostname, port: c.port || 443, sni: c.sni || hostname, note: c.note || '' });
         }
 
-        // Generate VLESS configs for each clean IP (normal + Anti-DPI twin)
-        const vlessConfigs = allIPs.map(ip => {
+        // Generate VLESS configs per clean IP (variant families A/B/C — A/B links byte-identical
+        // to the legacy plain/Anti-DPI pair; display names now carry the family label)
+        const cfgFlags = await sgVariantFlags(env);
+        const vlessConfigs = allIPs.flatMap(ip => {
             const host = ip.ip || hostname;
             const base = `vless://${user.uuid}@${sgLinkHost(host)}:${ip.port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${ip.sni}`;
-            return [
-                { name: ip.name, link: `${base}#VLESS-${ip.name}`, note: ip.note },
-                { name: `${ip.name} · Anti-DPI`, link: `${base}${ANTI_DPI_PARAMS}#VLESS-${ip.name} · Anti-DPI`, note: ip.note }
-            ];
-        }).flat();
+            const isV6 = String(ip.ip || '').includes(':');
+            return sgBuildLinkVariants({ flags: cfgFlags, isIPv6: isV6 }).map(v => ({
+                name: `${ip.name} · ${v.label}`,
+                link: `${base}${v.params}#VLESS-${ip.name}${v.frag}`,
+                note: ip.note
+            }));
+        });
 
         return mgmtJsonResponse({
             user: {
@@ -1624,7 +1682,8 @@ async function mgmtTestCleanIP(request, env) {
             try {
                 const headers = {};
                 if (sni) headers['Host'] = sni;
-                const response = await fetch(`https://${ip}:${port}/`, {
+                const probeHost = String(ip).includes(':') ? '[' + ip + ']' : ip; // IPv6 literal needs brackets in URLs
+                const response = await fetch(`https://${probeHost}:${port}/`, {
                     method: 'HEAD',
                     headers,
                     redirect: 'follow',
@@ -2137,7 +2196,7 @@ async function mgmtHandleRequest(request, env, ctx) {
                 }
                 const host = url.hostname;
                 const subUrl = `https://${host}/sub?token=${await MD5MD5(host + panelUser.uuid)}`;
-                const linkBase = `%PROTO%://${panelUser.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${panelUser.uuid}%3D%3D&sni=%SNI%%ANTIDPI%#ShadowVPN - ${encodeURIComponent(panelUser.username || 'user')}`;
+                const linkBase = `%PROTO%://${panelUser.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${panelUser.uuid}%3D%3D&sni=%SNI%%VAR%#ShadowVPN - ${encodeURIComponent(panelUser.username || 'user')}`;
                 const protocols = typeof panelUser.protocols === 'string' ? JSON.parse(panelUser.protocols || '{}') : (panelUser.protocols || {});
                 const pData = await userPanelFetchData(env, panelUser);
                 pData.user = panelUser;
@@ -2201,7 +2260,7 @@ async function mgmtHandleRequest(request, env, ctx) {
                     if (subUA.includes('mozilla') && !wantsRaw) {
                         const host = url.hostname;
                         const panelSubUrl = `https://${host}/sub?token=${subToken}`;
-                        const linkBase = `%PROTO%://${user.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=%SNI%%ANTIDPI%#ShadowVPN - ${encodeURIComponent(user.username || 'user')}`;
+                        const linkBase = `%PROTO%://${user.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=%SNI%%VAR%#ShadowVPN - ${encodeURIComponent(user.username || 'user')}`;
                         const panelProtocols = typeof user.protocols === 'string' ? JSON.parse(user.protocols || '{}') : (user.protocols || {});
                         const pData = await userPanelFetchData(env, user);
                         pData.user = user;
@@ -2259,6 +2318,9 @@ async function mgmtHandleRequest(request, env, ctx) {
 
                     // Anti-DPI parameters (fragmentation + unsafe fp + cipher suites)
                     const antiDpiParams = ANTI_DPI_PARAMS;
+                    // Variant families A/B/C (settings-tunable: sg_variant_*, sg_ech_config)
+                    const vFlags = await sgVariantFlags(env);
+                    const forConverter = url.searchParams.has('target') || url.searchParams.has('b64') || url.searchParams.has('base64') || (request.headers.get('User-Agent') || '').toLowerCase().includes('subconverter');
 
                     // ===== NORMAL CONFIGS (always generated, NO antiDpiParams) =====
                     // SECURITY: never emit the worker DOMAIN as connect address — users
@@ -2275,25 +2337,26 @@ async function mgmtHandleRequest(request, env, ctx) {
                         const cHost = c.ip || host;
                         const cPort = c.port || 443;
                         const cSni = c.sni || host;
-                        if (protocols.vless !== false) {
-                            configs.push(`vless://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
-                            configs.push(`vless://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name} · Anti-DPI)`);
-                        }
-                        if (protocols.trojan !== false) {
-                            configs.push(`trojan://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
-                            configs.push(`trojan://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name} · Anti-DPI)`);
+                        const isV6 = String(c.ip || '').includes(':');
+                        for (const v of sgBuildLinkVariants({ flags: vFlags, isIPv6: isV6 })) {
+                            if (protocols.vless !== false) {
+                                configs.push(`vless://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${v.params}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name}${v.frag})`);
+                            }
+                            if (protocols.trojan !== false) {
+                                configs.push(`trojan://${user.uuid}@${sgLinkHost(cHost)}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}${v.params}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name}${v.frag})`);
+                            }
                         }
                     }
                     // Fallback: no clean IPs configured at all → one domain-443 entry so
                     // the sub is never empty (operator should configure clean IPs).
                     if (activeCleanIPs.length === 0) {
-                        if (protocols.vless !== false) {
-                            configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
-                            configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443 · Anti-DPI)`);
-                        }
-                        if (protocols.trojan !== false) {
-                            configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
-                            configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443 · Anti-DPI)`);
+                        for (const v of sgBuildLinkVariants({ flags: vFlags, isIPv6: false })) {
+                            if (protocols.vless !== false) {
+                                configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D${v.params}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443${v.frag})`);
+                            }
+                            if (protocols.trojan !== false) {
+                                configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D${v.params}#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443${v.frag})`);
+                            }
                         }
                     }
 
@@ -2314,8 +2377,12 @@ async function mgmtHandleRequest(request, env, ctx) {
                         }
                     }
 
-                    // Return as subscription (one config per line)
-                    return new Response(configs.join('\n'), {
+                    // Return as subscription (one config per line).
+                    // External converters (Clash/sing-box via subconverter) get `ech` STRIPPED so
+                    // their parsers never see the new param (fp/alpn survive conversion).
+                    let subBody = configs.join('\n');
+                    if (forConverter) subBody = subBody.split('\n').map(l => l.replace(/&ech=[^#]*/, '')).join('\n');
+                    return new Response(subBody, {
                         headers: {
                             'Content-Type': 'text/plain; charset=utf-8',
                             'Content-Disposition': 'attachment; filename="configs.txt"',
@@ -2982,7 +3049,7 @@ function mgmtAdminHTML() {
                     <input type="hidden" id="cleanIPEditId">
                     <div class="form-group"><label>نام</label><input type="text" id="cleanIPName" placeholder="مثلاً: Cloudflare CDN"></div>
                     <div class="form-row">
-                        <div class="form-group"><label>آی‌پی / دامنه</label><input type="text" id="cleanIPIP" placeholder="مثلاً: 104.16.0.1"></div>
+                        <div class="form-group"><label>آی‌پی / دامنه</label><input type="text" id="cleanIPIP" placeholder="مثلاً: 104.16.0.1 یا [2a01:4700::1]:2087"></div>
                         <div class="form-group"><label>پورت</label><input type="number" id="cleanIPPort" value="443" min="1" max="65535"></div>
                     </div>
                     <div class="form-group"><label>SNI</label><input type="text" id="cleanIPSNI" placeholder="خالی = آیپی/دامنه"></div>
@@ -3034,6 +3101,22 @@ function mgmtAdminHTML() {
                     <div class="form-group">
                         <label>آیدی ادمین تلگرام</label>
                         <input type="text" id="settingTelegramAdmin" placeholder="Chat ID">
+                    </div>
+                    <div class="form-group">
+                        <label>خانواده لینک‌های اشتراک (بدون دیپلوی تغییر می‌کند)</label>
+                        <div style="display:flex;gap:1rem;flex-wrap:wrap;font-weight:400">
+                            <label><input type="checkbox" id="sgVariantPlain" checked> ساده</label>
+                            <label><input type="checkbox" id="sgVariantIrancell" checked> ایرانسل F&F</label>
+                            <label><input type="checkbox" id="sgVariantMci" checked> همراه‌اول (ECH/IPv6)</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>آدرس ECH خانواده همراه‌اول</label>
+                        <input type="text" id="sgEchConfig" placeholder="cloudflare-ech.com+udp://1.1.1.1">
+                    </div>
+                    <div class="form-group">
+                        <label>پیشوند IPv4 دستگاه (٪)</label>
+                        <input type="number" id="sgV4Prefix" value="24" min="8" max="32">
                     </div>
                     <div class="form-group">
                         <label>تغییر رمز عبور ادمین</label>
@@ -3950,6 +4033,12 @@ function mgmtAdminHTML() {
                     document.getElementById('settingExpiryWarning').value = d.settings.expiry_warning_days || 7;
                     document.getElementById('settingTelegramToken').value = d.settings.telegram_bot_token || '';
                     document.getElementById('settingTelegramAdmin').value = d.settings.telegram_admin_id || '';
+                    var off = v => v === '0' || v === 'off' || v === 'false';
+                    document.getElementById('sgVariantPlain').checked = !off(d.settings.sg_variant_plain);
+                    document.getElementById('sgVariantIrancell').checked = !off(d.settings.sg_variant_irancell);
+                    document.getElementById('sgVariantMci').checked = !off(d.settings.sg_variant_mci);
+                    document.getElementById('sgEchConfig').value = d.settings.sg_ech_config || '';
+                    document.getElementById('sgV4Prefix').value = d.settings.sg_ipv4_prefix || 24;
                 }
             } catch (e) { console.error('Settings error:', e); }
         }
@@ -3965,7 +4054,12 @@ function mgmtAdminHTML() {
                         expiry_warning_days: document.getElementById('settingExpiryWarning').value,
                         telegram_bot_token: document.getElementById('settingTelegramToken').value,
                         telegram_admin_id: document.getElementById('settingTelegramAdmin').value,
-                        admin_password: document.getElementById('settingAdminPassword').value || undefined
+                        admin_password: document.getElementById('settingAdminPassword').value || undefined,
+                        sg_variant_plain: document.getElementById('sgVariantPlain').checked ? '1' : '0',
+                        sg_variant_irancell: document.getElementById('sgVariantIrancell').checked ? '1' : '0',
+                        sg_variant_mci: document.getElementById('sgVariantMci').checked ? '1' : '0',
+                        sg_ech_config: document.getElementById('sgEchConfig').value || '',
+                        sg_ipv4_prefix: String(document.getElementById('sgV4Prefix').value || '24')
                     })
                 });
                 var pwd = document.getElementById('settingAdminPassword').value;
@@ -4122,11 +4216,23 @@ function mgmtAdminHTML() {
                 if (hash !== -1) { name = line.slice(hash + 1).trim(); line = line.slice(0, hash).trim(); }
                 var port = 443;
                 var addr = line;
-                var colon = line.lastIndexOf(':');
-                if (colon !== -1 && /^\\d+$/.test(line.slice(colon + 1))) {
-                    port = parseInt(line.slice(colon + 1)) || 443;
-                    addr = line.slice(0, colon);
+                if (line.charAt(0) === '[') {
+                    // bracket form: [2a01:4700::1]:2087 — IPv6 with explicit port
+                    var close = line.indexOf(']');
+                    if (close > 1) {
+                        addr = line.slice(1, close);
+                        var rest = line.slice(close + 1);
+                        if (rest.charAt(0) === ':' && /^\\d+$/.test(rest.slice(1))) port = parseInt(rest.slice(1)) || 443;
+                    }
+                } else if ((line.split(':').length - 1) < 2) {
+                    // single colon: IPv4 or host:port — legacy behavior
+                    var colon = line.lastIndexOf(':');
+                    if (colon !== -1 && /^\\d+$/.test(line.slice(colon + 1))) {
+                        port = parseInt(line.slice(colon + 1)) || 443;
+                        addr = line.slice(0, colon);
+                    }
                 }
+                // bare IPv6 (>=2 colons, no brackets): whole line is the address, port 443
                 if (!addr) continue;
                 items.push({ name: name || addr, ip: addr, port: port, sni: '' });
             }
@@ -4145,7 +4251,7 @@ function mgmtAdminHTML() {
         }
         function cleanIPExportLine(c) {
             // Copy format = what "افزودن گروهی" accepts: IP:PORT#Name (SNI rows use pipe form)
-            return c.sni ? (c.name + ' | ' + c.ip + ' | ' + c.port + ' | ' + c.sni) : (c.ip + ':' + c.port + '#' + c.name);
+            return c.sni ? (c.name + ' | ' + c.ip + ' | ' + c.port + ' | ' + c.sni) : ((c.ip.indexOf(':') !== -1 ? '[' + c.ip + ']' : c.ip) + ':' + c.port + '#' + c.name);
         }
         async function copyCleanIPRow(id) {
             var c = _cleanIPCache.find(function(x){ return x.id === id; });
@@ -4531,6 +4637,7 @@ function userPanelBuildAppLinks(subUrl) {
 }
 
 async function userPanelFetchData(env, user) {
+    const variantFlags = await sgVariantFlags(env); // settings-tunable link families for the panel
     // Assembles everything the panel shows from D1 for one user row.
     const uid = user.id;
     const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
@@ -4570,7 +4677,7 @@ async function userPanelFetchData(env, user) {
         devices = r?.c || 0;
     } catch (e) { /* ignore */ }
 
-    return { maxBW, usedBW, daily, cleanIPs, recentConns, devices };
+    return { maxBW, usedBW, daily, cleanIPs, recentConns, devices, variantFlags };
 }
 
 function userPanelFormatBytes(b) {
@@ -4617,12 +4724,16 @@ function userPanelHTML(data) {
     const timeClass = daysLeft === null ? 'ok' : daysLeft <= 3 ? 'dg' : daysLeft <= 7 ? 'wn' : 'ok';
 
     // Build node list client-side data (JSON, injected safely).
-    // Every node is emitted twice: plain + Anti-DPI (fp=unsafe / cs / fm trio).
+    // Each endpoint emits variant families in order A (ساده), B (ایرانسل F&F — byte-identical
+    // Anti-DPI link), then C (همراه‌اول ECH for domains/IPv4; IPv6 + IPv6 F&F for IPv6 hosts).
     const nodes = [];
+    const vFlags = data.variantFlags || {};
     const pushNode = (name, proto, port, sni, host) => {
         const base = data.linkBase.replace('%PROTO%', proto).replace('%PORT%', port).replace('%SNI%', sni).replace('%HOST%', sgLinkHost(host));
-        nodes.push({ name: name, link: base.replace('%ANTIDPI%', '') });
-        nodes.push({ name: name + ' · Anti-DPI', link: base.replace('%ANTIDPI%', ANTI_DPI_PARAMS) });
+        const isV6 = typeof host === 'string' && host.includes(':');
+        for (const v of sgBuildLinkVariants({ flags: vFlags, isIPv6: isV6 })) {
+            nodes.push({ name: name + ' · ' + v.label, link: base.replace('%VAR%', v.params) });
+        }
     };
     if (protocols.vless !== false || protocols.trojan !== false) {
         for (const port of ['443', '2053', '2096']) {
@@ -7632,6 +7743,7 @@ function 解码WS早期数据(header, token) {
 
 ///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
 async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env = null, ctx = null) {
+	if (env && env.DB) await sgLoadV4Prefix(env); // refresh device-prefix setting (sg_ipv4_prefix; no redeploy to change)
 	// Generate unique connection ID for tracking
 	const connectionId = crypto.randomUUID();
 	// Load active UUIDs from D1 for management system
@@ -8060,13 +8172,15 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 				if (!isValid) {
 					log(`[WS] UUID ${parsedUUID} rejected from ${clientIP} - limits exceeded`);
 					serverSock.close(4003, 'Connection limit reached');
-					return;
+					// fetch contract: ALWAYS return a Response — handshake was already accepted,
+					// so complete the 101 with the (closed) client socket.
+					return new Response(null, { status: 101, webSocket: clientSock });
 				}
 				const tracked = await mgmtAddActiveConnection(env, parsedUUID, connectionId, clientIP, proto);
 				if (!tracked) {
 					log(`[WS] UUID ${parsedUUID} rejected from ${clientIP} - tracking failed`);
 					serverSock.close(4003, 'Connection tracking failed');
-					return;
+					return new Response(null, { status: 101, webSocket: clientSock });
 				}
 				connectionTracked = true;
 				clientSubnet = getSubnetGroup(clientIP);
