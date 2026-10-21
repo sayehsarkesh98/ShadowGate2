@@ -60,17 +60,41 @@ function sgLinkHost(h) {
 // --- Link variant families (A/B/C) for Iranian ISP filtering profiles ---
 // A = plain (unchanged legacy link)          B = Irancell F&F (byte-identical ANTI_DPI_PARAMS)
 // C = MCI/TCI: fp=chrome + alpn only (the Xray-only cs/fm trio stays B-only), except C3 adds fm.
+//   C1 is emitted once per ECH config in SG_ECH_MODES (one link each, same flags, different `ech=`).
 const SG_MCI_COMMON = '&fp=chrome&alpn=http%2F1.1';
 const SG_ECH_DEFAULT = 'cloudflare-ech.com+udp://1.1.1.1';
+// ECH configs for the همراه‌اول family. Each entry = one extra link variant; `key` is what the
+// settings row sg_ech_modes lists (comma-separated, unknown keys ignored), `label` is appended to
+// the link name. All values are Xray tlsSettings.echConfigList strings:
+//   "<query-domain>+<scheme>://<dns-server>"  (scheme: udp | https | h2c)
+// defaultOn decides what is emitted when sg_ech_modes is unset; h2c is registered but off — Xray
+// only honours it when the ECH query is dialed through a TLS outbound (see echOutbound).
+const SG_ECH_MODES = [
+    { key: 'udp',     label: 'همراه‌اول ECH',        config: 'cloudflare-ech.com+udp://1.1.1.1',                     defaultOn: true },
+    { key: 'doh8888', label: 'همراه‌اول ECH DoH',    config: 'cloudflare-ech.com+https://8.8.8.8/dns-query',         defaultOn: true },
+    { key: 'crypto',  label: 'همراه‌اول ECH Crypto', config: 'crypto.cloudflare.com+udp://1.1.1.1',                  defaultOn: true },
+    { key: 'h2c',     label: 'همراه‌اول ECH h2c',    config: 'cloudflare-ech.com+h2c://1.1.1.1/dns-query',           defaultOn: false }
+];
+const SG_ECH_MODE_KEYS = SG_ECH_MODES.map(m => m.key);
 // Tunables in the settings table (no redeploy): sg_variant_plain / sg_variant_irancell /
-// sg_variant_mci (default ON when unset) + sg_ech_config (default above).
+// sg_variant_mci (default ON when unset) + sg_ech_config (overrides the udp entry's address
+// for backward compatibility) + sg_ech_modes (which ECH entries above to emit).
 async function sgVariantFlags(env) {
     const on = v => !(v === '0' || v === 'off' || v === 'false');
-    const [p, i, m, e] = await Promise.all([
+    const [p, i, m, e, modes] = await Promise.all([
         getSetting(env, 'sg_variant_plain'), getSetting(env, 'sg_variant_irancell'),
-        getSetting(env, 'sg_variant_mci'), getSetting(env, 'sg_ech_config')
+        getSetting(env, 'sg_variant_mci'), getSetting(env, 'sg_ech_config'),
+        getSetting(env, 'sg_ech_modes')
     ]);
-    return { plain: on(p), irancell: on(i), mci: on(m), ech: (e && String(e).trim()) || SG_ECH_DEFAULT };
+    const customEch = e && String(e).trim();
+    let list = SG_ECH_MODES.map(x => ({ ...x }));
+    const picked = (modes || '').split(',').map(s => s.trim()).filter(s => SG_ECH_MODE_KEYS.includes(s));
+    if (customEch) list[0].config = customEch; // legacy single-value row still wins for "udp"
+    // Unset row -> defaultOn set (udp + doh8888 + crypto); set row -> exactly what it lists.
+    // (an empty row is indistinguishable from unset in D1 — both mean "default set")
+    list = picked.length ? list.filter(x => picked.includes(x.key)) : list.filter(x => x.defaultOn);
+    if (!list.length) list = [{ key: 'udp', label: 'همراه‌اول ECH', config: customEch || SG_ECH_DEFAULT }];
+    return { plain: on(p), irancell: on(i), mci: on(m), ech: (customEch || SG_ECH_DEFAULT), echModes: list };
 }
 // Ordered variants for ONE endpoint. params -> appended before '#frag'; frag -> appended to the
 // legacy fragment (A='' and B=' · Anti-DPI' keep today's links BYTE-IDENTICAL); label -> display name.
@@ -85,8 +109,10 @@ function sgBuildLinkVariants(opts) {
             out.push({ params: SG_MCI_COMMON, frag: ' · همراه‌اول IPv6', label: 'همراه‌اول IPv6' });
             out.push({ params: SG_MCI_COMMON + '&fm=' + encodeURIComponent(SG_FINAL_MASK), frag: ' · همراه‌اول IPv6 F&F', label: 'همراه‌اول IPv6 F&F' });
         } else {
-            const ech = (f.ech && String(f.ech).trim()) || SG_ECH_DEFAULT;
-            out.push({ params: SG_MCI_COMMON + '&ech=' + encodeURIComponent(ech), frag: ' · همراه‌اول ECH', label: 'همراه‌اول ECH' });
+            const modes = (f.echModes && f.echModes.length) ? f.echModes : [{ key: 'udp', label: 'همراه‌اول ECH', config: (f.ech && String(f.ech).trim()) || SG_ECH_DEFAULT }];
+            for (const m of modes) {
+                out.push({ params: SG_MCI_COMMON + '&ech=' + encodeURIComponent(m.config), frag: ' · ' + m.label, label: m.label, key: m.key });
+            }
         }
     }
     return out;
@@ -3111,7 +3137,16 @@ function mgmtAdminHTML() {
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>آدرس ECH خانواده همراه‌اول</label>
+                        <label>حالت‌های ECH خانواده همراه‌اول</label>
+                        <div style="display:flex;gap:1rem;flex-wrap:wrap;font-weight:400">
+                            <label><input type="checkbox" id="sgEchModeUdp" checked> udp://1.1.1.1</label>
+                            <label><input type="checkbox" id="sgEchModeDoh" checked> DoH 8.8.8.8</label>
+                            <label><input type="checkbox" id="sgEchModeCrypto" checked> crypto.cloudflare.com</label>
+                            <label><input type="checkbox" id="sgEchModeH2c"> h2c://1.1.1.1</label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>آدرس ECH حالت udp (جایگزین پیش‌فرض)</label>
                         <input type="text" id="sgEchConfig" placeholder="cloudflare-ech.com+udp://1.1.1.1">
                     </div>
                     <div class="form-group">
@@ -4039,6 +4074,13 @@ function mgmtAdminHTML() {
                     document.getElementById('sgVariantMci').checked = !off(d.settings.sg_variant_mci);
                     document.getElementById('sgEchConfig').value = d.settings.sg_ech_config || '';
                     document.getElementById('sgV4Prefix').value = d.settings.sg_ipv4_prefix || 24;
+                    // sg_ech_modes: unset row = built-in default set (udp + DoH + crypto)
+                    var echModes = (d.settings.sg_ech_modes || '').split(',').map(s => s.trim()).filter(Boolean);
+                    var echOn = k => echModes.length ? echModes.indexOf(k) !== -1 : (k !== 'h2c');
+                    document.getElementById('sgEchModeUdp').checked = echOn('udp');
+                    document.getElementById('sgEchModeDoh').checked = echOn('doh8888');
+                    document.getElementById('sgEchModeCrypto').checked = echOn('crypto');
+                    document.getElementById('sgEchModeH2c').checked = echOn('h2c');
                 }
             } catch (e) { console.error('Settings error:', e); }
         }
@@ -4059,6 +4101,7 @@ function mgmtAdminHTML() {
                         sg_variant_irancell: document.getElementById('sgVariantIrancell').checked ? '1' : '0',
                         sg_variant_mci: document.getElementById('sgVariantMci').checked ? '1' : '0',
                         sg_ech_config: document.getElementById('sgEchConfig').value || '',
+                        sg_ech_modes: ['udp', 'doh8888', 'crypto', 'h2c'].filter(k => document.getElementById('sgEchMode' + ({udp:'Udp',doh8888:'Doh',crypto:'Crypto',h2c:'H2c'}[k])).checked).join(','),
                         sg_ipv4_prefix: String(document.getElementById('sgV4Prefix').value || '24')
                     })
                 });
